@@ -16,7 +16,14 @@ $StartupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'AI Limits.lnk
 if (-not (Test-Path $AppDir)) { New-Item -ItemType Directory -Path $AppDir | Out-Null }
 
 function Write-Log([string]$msg) {
-    try { Add-Content -Path $LogPath -Value ('[{0}] {1}' -f (Get-Date -Format 's'), $msg) -Encoding UTF8 } catch {}
+    try {
+        # keep the log small: past 1 MB the older half is dropped
+        if ((Test-Path $LogPath) -and (Get-Item $LogPath).Length -gt 1MB) {
+            $keep = @(Get-Content $LogPath -Tail 2000)
+            Set-Content -Path $LogPath -Value $keep -Encoding UTF8
+        }
+        Add-Content -Path $LogPath -Value ('[{0}] {1}' -f (Get-Date -Format 's'), $msg) -Encoding UTF8
+    } catch {}
 }
 
 # ---------- single instance ----------
@@ -291,6 +298,10 @@ namespace AILimitsUI {
     }
 
     // Pill-shaped button with anti-aliased edges.
+    public class BufferedPanel : Panel {
+        public BufferedPanel() { DoubleBuffered = true; ResizeRedraw = true; }
+    }
+
     // Flat colours for context menus (tray menu, "+ Add service")
     public class FlatColors : ProfessionalColorTable {
         public static Color Bg = Color.FromArgb(0xFA, 0xFA, 0xF8);
@@ -319,6 +330,7 @@ namespace AILimitsUI {
         public Color HoverColor = Color.Empty;
         public Color BorderColor = Color.Empty;
         public float Radius = -1f;   // < 0 = pill
+        public Color CornerColor = Color.Empty;   // what shows outside the rounded corners (default: parent's colour)
         bool hover;
         public RoundButton() {
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
@@ -332,7 +344,7 @@ namespace AILimitsUI {
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            g.Clear(Parent != null ? Parent.BackColor : SystemColors.Control);
+            g.Clear(!CornerColor.IsEmpty ? CornerColor : (Parent != null ? Parent.BackColor : SystemColors.Control));
             Color bg = (hover && !HoverColor.IsEmpty && Enabled) ? HoverColor : BackColor;
             if (!Enabled) bg = Color.FromArgb(120, bg);
             float h = Height - 1f, w = Width - 1f, d = Math.Min(h, w);
@@ -415,8 +427,11 @@ namespace AILimitsUI {
     public class Price { public string Pattern; public double In, Out, Read, W5, W1; }
 
     public class UsageSummary {
-        public double MonthCost, TodayCost, MonthTokens, MonthRequests;
+        public double MonthCost, TodayCost, MonthTokens, MonthRequests, PrevMonthCost, TodayRequests;
         public double[] Hours = new double[24];
+        public double[] MonthDays = new double[31];   // this month, index = day - 1
+        public double[] PrevDays = new double[31];    // previous month, index = day - 1
+        public Dictionary<string, string> ProjectModel = new Dictionary<string, string>();
         public List<KeyValuePair<string, double>> Days = new List<KeyValuePair<string, double>>();
         public List<KeyValuePair<string, double>> Models = new List<KeyValuePair<string, double>>();
         public List<KeyValuePair<string, double>> Projects = new List<KeyValuePair<string, double>>();
@@ -631,13 +646,17 @@ namespace AILimitsUI {
             string today = now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
             string month = now.ToString("yyyy-MM", CultureInfo.InvariantCulture);
             string from = now.Date.AddDays(-13).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            DateTime prevStart = new DateTime(now.Year, now.Month, 1).AddMonths(-1);
+            string prevMonth = prevStart.ToString("yyyy-MM", CultureInfo.InvariantCulture);
+            var projModels = new Dictionary<string, Dictionary<string, double>>();
             if (File.Exists(usageF)) {
                 foreach (string l in File.ReadLines(usageF)) {
                     string[] a = l.Split('\t');
                     if (a.Length < 9 || a[0].Length < 13) continue;
                     string day = a[0].Substring(0, 10);
                     bool inMonth = a[0].StartsWith(month, StringComparison.Ordinal);
-                    if (!inMonth && string.CompareOrdinal(day, from) < 0) continue;
+                    bool inPrev = a[0].StartsWith(prevMonth, StringComparison.Ordinal);
+                    if (!inMonth && !inPrev && string.CompareOrdinal(day, from) < 0) continue;
                     Price p;
                     string ck = a[1] + "|" + a[2];
                     if (!cache.TryGetValue(ck, out p)) { p = FindPrice(prices, a[2], a[1]); cache[ck] = p; }
@@ -645,13 +664,19 @@ namespace AILimitsUI {
                     double w5 = double.Parse(a[6], CultureInfo.InvariantCulture), w1 = double.Parse(a[7], CultureInfo.InvariantCulture), cr = double.Parse(a[8], CultureInfo.InvariantCulture);
                     double cost = (inp * p.In + outp * p.Out + cr * p.Read + w5 * p.W5 + w1 * p.W1) / 1e6;
                     if (string.CompareOrdinal(day, from) >= 0) { double v; days.TryGetValue(day, out v); days[day] = v + cost; }
+                    int dom; int.TryParse(day.Substring(8, 2), out dom);
+                    if (inPrev && dom >= 1 && dom <= 31) { sum.PrevDays[dom - 1] += cost; sum.PrevMonthCost += cost; }
                     if (inMonth) {
+                        if (dom >= 1 && dom <= 31) sum.MonthDays[dom - 1] += cost;
                         sum.MonthCost += cost; sum.MonthTokens += inp + outp + w5 + w1 + cr; sum.MonthRequests += 1;
                         string pm = PrettyModel(a[2]); double v2; models.TryGetValue(pm, out v2); models[pm] = v2 + cost;
                         double v3; projects.TryGetValue(a[3], out v3); projects[a[3]] = v3 + cost;
+                        Dictionary<string, double> pmd;
+                        if (!projModels.TryGetValue(a[3], out pmd)) { pmd = new Dictionary<string, double>(); projModels[a[3]] = pmd; }
+                        double v4; pmd.TryGetValue(pm, out v4); pmd[pm] = v4 + cost;
                     }
                     if (day == today) {
-                        sum.TodayCost += cost;
+                        sum.TodayCost += cost; sum.TodayRequests += 1;
                         int hr; if (int.TryParse(a[0].Substring(11, 2), out hr) && hr >= 0 && hr < 24) sum.Hours[hr] += cost;
                     }
                 }
@@ -663,6 +688,11 @@ namespace AILimitsUI {
             }
             var ml = new List<KeyValuePair<string, double>>(models); ml.Sort((x, y) => y.Value.CompareTo(x.Value)); sum.Models = ml;
             var pl = new List<KeyValuePair<string, double>>(projects); pl.Sort((x, y) => y.Value.CompareTo(x.Value)); sum.Projects = pl;
+            foreach (var kv in projModels) {
+                string best = ""; double bv = -1;
+                foreach (var m in kv.Value) if (m.Value > bv) { bv = m.Value; best = m.Key; }
+                sum.ProjectModel[kv.Key] = best;
+            }
             return sum;
         }
     }
@@ -711,7 +741,8 @@ function Get-FirstFont([string[]]$names) { foreach ($n in $names) { if (Test-Fon
 $FontNum = Get-FirstFont @('Bahnschrift', 'Segoe UI')
 $FontNumSemi = Get-FirstFont @('Bahnschrift SemiBold', 'Segoe UI Semibold')
 $FontMono = Get-FirstFont @('Cascadia Mono', 'Consolas')
-$FontUi = 'Segoe UI'
+$FontUi = Get-FirstFont @('Segoe UI Variable Text', 'Segoe UI')
+$FontUiSemi = Get-FirstFont @('Segoe UI Variable Text Semibold', 'Segoe UI Semibold')
 $Fonts = @{
     Title = New-PxFont $FontNumSemi 12
     Name  = New-PxFont $FontNumSemi 14
@@ -743,12 +774,13 @@ $DlgColors = @{
     Accent = (New-Rgb '#121212'); Danger = (New-Rgb '#B42318'); Ok = (New-Rgb '#2F6B45'); Warn = (New-Rgb '#B33C0C')
 }
 $DlgFonts = @{
-    Body = New-Object System.Drawing.Font($FontUi, 9.75)
-    Small = New-Object System.Drawing.Font($FontUi, 8.25)
-    Btn = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
-    H1 = New-Object System.Drawing.Font($FontNumSemi, 15)
-    Caps = New-Object System.Drawing.Font('Segoe UI Semibold', 7.5)
-    Mono = New-Object System.Drawing.Font($FontMono, 9)
+    Body = New-Object System.Drawing.Font($FontUi, 10.5)
+    Small = New-Object System.Drawing.Font($FontUi, 9.5)
+    Label = New-Object System.Drawing.Font($FontUiSemi, 9.75)
+    Btn = New-Object System.Drawing.Font($FontUiSemi, 9.75)
+    H1 = New-Object System.Drawing.Font($FontNumSemi, 16.5)
+    Caps = New-Object System.Drawing.Font($FontUiSemi, 8.25)
+    Mono = New-Object System.Drawing.Font($FontMono, 10)
 }
 
 function New-RoundPath([single]$x, [single]$y, [single]$w, [single]$h, [single]$r) {
@@ -899,9 +931,17 @@ function Set-DefaultProfile($prov, $list) {
 }
 function Load-Config {
     $cfg = [ordered]@{ interval = 5; x = -1; y = -1; theme = 'dark'; providers = New-Object System.Collections.ArrayList }
-    if (Test-Path $CfgPath) {
+    $j = $null
+    foreach ($cand in @($CfgPath, ($CfgPath + '.bak'))) {
+        if ($null -ne $j -or -not (Test-Path $cand)) { continue }
+        try { $j = Get-Content $cand -Raw -Encoding UTF8 | ConvertFrom-Json; if ($cand -ne $CfgPath) { Write-Log "config: main file unreadable, restored from backup" } }
+        catch {
+            Write-Log "config: cannot read $cand : $_"
+            try { Copy-Item $cand ($cand + '.broken-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) -ErrorAction SilentlyContinue } catch { }
+        }
+    }
+    if ($null -ne $j) {
         try {
-            $j = Get-Content $CfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
             if ($j.interval) { $cfg.interval = [int]$j.interval }
             if ($j.theme -eq 'light') { $cfg.theme = 'light' }
             if ($j.textMode) { $cfg['textMode'] = [string]$j.textMode }
@@ -915,7 +955,7 @@ function Load-Config {
             foreach ($h in $cfg.providers) { Set-DefaultProfile $h $cfg.providers }
             foreach ($k in 'hotkey', 'autoHide', 'compact', 'launcherVersion', 'shortcutsMade') { if ($null -ne $j.$k) { $cfg[$k] = $j.$k } }
         } catch { Write-Log "config: $_" }
-    } else {
+    } elseif (-not (Test-Path $CfgPath)) {
         $first = New-Provider 'claude-code'
         $first['profile'] = 'browser'
         [void]$cfg.providers.Add($first)
@@ -925,8 +965,22 @@ function Load-Config {
     if (-not $cfg.Contains('compact')) { $cfg['compact'] = $false }
     $cfg
 }
+# Written to a temporary file first and swapped in, so a crash or power loss mid-write
+# can never leave a half-written config (which would lose every saved key).
 function Save-Config {
-    try { $script:cfg | ConvertTo-Json -Depth 6 | Set-Content -Path $CfgPath -Encoding UTF8 } catch { Write-Log "save: $_" }
+    try {
+        $json = $script:cfg | ConvertTo-Json -Depth 6
+        $tmp = $CfgPath + '.tmp'
+        [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+        if (Test-Path $CfgPath) {
+            try { [System.IO.File]::Replace($tmp, $CfgPath, ($CfgPath + '.bak')) }
+            catch {
+                # some drives (network / synced folders) refuse the atomic swap: fall back to copy + overwrite
+                Copy-Item $CfgPath ($CfgPath + '.bak') -Force -ErrorAction SilentlyContinue
+                Move-Item $tmp $CfgPath -Force
+            }
+        } else { [System.IO.File]::Move($tmp, $CfgPath) }
+    } catch { Write-Log "save: $_" }
 }
 function Set-Autostart([bool]$on) {
     if ($on) {
@@ -2522,7 +2576,7 @@ function Paint-Widget($g, [bool]$draw) {
 }
 
 # Renders the widget into an ARGB image and hands it to Windows (per-pixel alpha).
-function Update-Visual {
+function Update-Visual([switch]$Recapture) {
     $t = Get-Theme
     $WW = Get-WidgetWidth
     if ($script:suppressed) {
@@ -2540,10 +2594,17 @@ function Update-Visual {
     $mg = [System.Drawing.Graphics]::FromImage($mask)
     try {
         $g.Clear($t.Card)
-        $bd = [AILimitsUI.Glass]::Backdrop($form.Handle, $form.Left, $form.Top, $WW, $h)
+        # Capturing the screen hides the widget for a frame and waits for the compositor, so it is done
+        # only on the glass timer, after a move or a size change - hover and redraws reuse the last capture.
+        $key = '{0},{1},{2},{3}' -f $form.Left, $form.Top, $WW, $h
+        if ($Recapture -or -not $script:bdCache -or $script:bdKey -ne $key) {
+            $nb = [AILimitsUI.Glass]::Backdrop($form.Handle, $form.Left, $form.Top, $WW, $h)
+            if ($script:bdCache) { $script:bdCache.Dispose() }
+            $script:bdCache = $nb; $script:bdKey = $key
+        }
+        $bd = $script:bdCache
         if ($bd) {
             $g.DrawImageUnscaled($bd, 0, 0)
-            $bd.Dispose()
             $veil = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb($t.Opacity, $t.Card))
             $g.FillRectangle($veil, 0, 0, $WW, $h)
             $veil.Dispose()
@@ -2664,6 +2725,10 @@ function Render-Results($results) {
     if ($null -ne $results) { $script:statusText = 'Updated ' + (Get-Date -Format 'HH:mm') }
     Update-Layout
     if ($null -ne $results) { Update-Tray $results }
+    # the fetch also rescans the Claude Code / Codex logs, so an open statistics window is redrawn from fresh data
+    if ($null -ne $results -and $script:statsForm -and -not $script:statsForm.IsDisposed) {
+        try { $script:statsUi.SumCache = @{}; Set-StatsRefreshing $false; Update-StatsView } catch { Write-Log "stats refresh: $_" }
+    }
     Keep-OnScreen
     if ($null -ne $results -and $script:firstPlace) {
         $script:firstPlace = $false
@@ -2742,7 +2807,7 @@ function Check-Job {
 }
 
 function Toggle-Window {
-    if ($form.Visible) { $form.Hide() } else { $form.Show(); $form.Activate() }
+    if ($form.Visible) { $form.Hide() } else { $form.Show(); $form.Activate(); Update-Visual -Recapture }
 }
 
 function Exit-App {
@@ -2789,7 +2854,7 @@ function Update-SettingsList {
 # a white input with a 1px border and inner padding (WinForms TextBox borders are too tight)
 function New-FieldBox([int]$w) {
     $pn = New-Object System.Windows.Forms.Panel
-    $pn.Size = New-Object System.Drawing.Size($w, (S 32))
+    $pn.Size = New-Object System.Drawing.Size($w, (S 36))
     $pn.BackColor = $DlgColors.Field
     $pn.Add_Paint({
         param($s, $e)
@@ -2802,8 +2867,8 @@ function New-FieldBox([int]$w) {
     $tb.BackColor = $DlgColors.Field
     $tb.ForeColor = $DlgColors.Text
     $tb.Font = $DlgFonts.Body
-    $tb.Location = New-Object System.Drawing.Point((S 9), [int](((S 32) - $tb.PreferredHeight) / 2))
-    $tb.Width = $w - (S 18)
+    $tb.Location = New-Object System.Drawing.Point((S 10), [int](((S 36) - $tb.PreferredHeight) / 2))
+    $tb.Width = $w - (S 20)
     $tb.Anchor = 'Left, Right, Top'
     $pn.Controls.Add($tb)
     $pn.Tag = $tb
@@ -2824,7 +2889,7 @@ function New-CapsLabel($parent, [string]$text, [int]$x, [int]$y) {
     $l = New-Object System.Windows.Forms.Label
     $l.Text = $text.ToUpperInvariant()
     $l.Font = $DlgFonts.Caps
-    $l.ForeColor = $DlgColors.Faint
+    $l.ForeColor = $DlgColors.Muted
     $l.AutoSize = $true
     $l.Location = New-Object System.Drawing.Point($x, $y)
     $parent.Controls.Add($l)
@@ -2880,7 +2945,7 @@ function Show-SettingsItem {
         if (-not $show) { continue }
         $wide = $WideFields -contains $f
         if ($wide) {
-            if ($leftOpen) { $y += S 60; $leftOpen = $false }
+            if ($leftOpen) { $y += S 70; $leftOpen = $false }
             $fx = $x0; $fw = $cw
         } elseif ($leftOpen) {
             $fx = $x0 + $half + (S 16); $fw = $half
@@ -2888,37 +2953,39 @@ function Show-SettingsItem {
             $fx = $x0; $fw = $half
         }
         $ui.Labels[$f].Location = New-Object System.Drawing.Point($fx, $y)
-        $ui.Frames[$f].Location = New-Object System.Drawing.Point($fx, ($y + (S 20)))
+        $ui.Frames[$f].Location = New-Object System.Drawing.Point($fx, ($y + (S 23)))
         $ui.Frames[$f].Width = $fw
-        if ($wide) { $y += S 60 }
-        elseif ($leftOpen) { $y += S 60; $leftOpen = $false }
+        if ($wide) { $y += S 70 }
+        elseif ($leftOpen) { $y += S 70; $leftOpen = $false }
         else { $leftOpen = $true }
     }
-    if ($leftOpen) { $y += S 60 }
+    if ($leftOpen) { $y += S 70 }
 
-    $ui.Cents.Visible = ($t.Fields -contains 'cents')
+    $showCents = ($t.Fields -contains 'cents')
+    $showAuto = ($t.Fields -contains 'autoRefresh')
+    $ui.Cents.Visible = $showCents
     $ui.Cents.Checked = [bool]$it.cents
     $ui.Cents.Top = $y
-    $ui.AutoRefresh.Visible = ($t.Fields -contains 'autoRefresh')
+    $ui.AutoRefresh.Visible = $showAuto
     $ui.AutoRefresh.Checked = ($it.autoRefresh -eq $true)
     $ui.AutoRefresh.Top = $y
-    if ($ui.AutoRefresh.Visible -or $ui.Cents.Visible) { $y += S 34 }
+    if ($showAuto -or $showCents) { $y += S 40 }
 
     # account actions: sign-ins and bridge for exactly this account
+    # (decided from the type: .Visible reads false until the window is on screen)
     $isClaude = ($it.type -eq 'claude-code'); $isCodex = ($it.type -eq 'codex')
-    $ui.BtnWeb.Visible = $isClaude; $ui.BtnCli.Visible = ($isClaude -or $isCodex); $ui.BtnBridge.Visible = $isClaude
-    $ui.ActLabel.Visible = ($isClaude -or $isCodex)
+    $acts = @()
+    if ($isClaude) { $acts = @($ui.BtnWeb, $ui.BtnCli, $ui.BtnBridge) } elseif ($isCodex) { $acts = @($ui.BtnCli) }
+    foreach ($b in @($ui.BtnWeb, $ui.BtnCli, $ui.BtnBridge)) { $b.Visible = ($acts -contains $b) }
+    $ui.ActLabel.Visible = ($acts.Count -gt 0)
     if ($isCodex) { $ui.BtnCli.Text = 'Codex sign-in…' } else { $ui.BtnCli.Text = 'Claude Code sign-in…' }
-    if ($ui.ActLabel.Visible) {
-        $y += S 6
+    if ($acts.Count -gt 0) {
+        $y += S 8
         $ui.ActLabel.Top = $y
-        $y += S 22
+        $y += S 26
         $bx = $x0
-        foreach ($b in @($ui.BtnWeb, $ui.BtnCli, $ui.BtnBridge)) {
-            if (-not $b.Visible) { continue }
-            $b.Top = $y; $b.Left = $bx; $bx += $b.Width + (S 8)
-        }
-        $y += S 34
+        foreach ($b in $acts) { $b.Top = $y; $b.Left = $bx; $bx += $b.Width + (S 8) }
+        $y += S 40
     }
     $ui.Spacer.Top = $y + (S 16)
     $script:loadingFields = $false
@@ -2949,7 +3016,7 @@ function Show-Settings {
         $script:ui = @{ Labels = @{}; Boxes = @{}; Frames = @{} }
         $ui = $script:ui
 
-        $FormW = S 780; $FormH = S 600; $SideW = S 230; $FootY = S 484
+        $FormW = S 820; $FormH = S 660; $SideW = S 240; $FootY = S 506
         $f = New-Object System.Windows.Forms.Form
         $f.Text = 'AI Limits — Settings'
         $f.FormBorderStyle = 'FixedDialog'
@@ -2972,12 +3039,12 @@ function Show-Settings {
 
         $lb = New-Object System.Windows.Forms.ListBox
         $lb.Location = New-Object System.Drawing.Point((S 10), (S 40))
-        $lb.Size = New-Object System.Drawing.Size(($SideW - (S 20)), (S 330))
+        $lb.Size = New-Object System.Drawing.Size(($SideW - (S 20)), (S 360))
         $lb.IntegralHeight = $false
         $lb.BorderStyle = 'None'
         $lb.BackColor = $DlgColors.Side
         $lb.DrawMode = 'OwnerDrawFixed'
-        $lb.ItemHeight = S 34
+        $lb.ItemHeight = S 38
         $lb.Add_DrawItem({
             param($s, $e)
             if ($e.Index -lt 0) { return }
@@ -3023,7 +3090,7 @@ function Show-Settings {
         }
         $btnAdd = New-Object AILimitsUI.RoundButton
         $btnAdd.Text = '+  Add service'
-        $btnAdd.Location = New-Object System.Drawing.Point((S 10), (S 380))
+        $btnAdd.Location = New-Object System.Drawing.Point((S 10), (S 412))
         $btnAdd.Size = New-Object System.Drawing.Size(($SideW - (S 20)), (S 34))
         $btnAdd.Add_Click({ $script:ui.AddMenu.Show($this, (New-Object System.Drawing.Point(0, $this.Height))) })
         $side.Controls.Add($btnAdd)
@@ -3031,7 +3098,7 @@ function Show-Settings {
 
         $btnAuto = New-Object AILimitsUI.RoundButton
         $btnAuto.Text = 'Connect automatically…'
-        $btnAuto.Location = New-Object System.Drawing.Point((S 10), (S 422))
+        $btnAuto.Location = New-Object System.Drawing.Point((S 10), (S 456))
         $btnAuto.Size = New-Object System.Drawing.Size(($SideW - (S 20)), (S 36))
         $btnAuto.Add_Click({ Show-AutoConnect })
         $side.Controls.Add($btnAuto)
@@ -3052,7 +3119,7 @@ function Show-Settings {
         $ui.Title.Font = $DlgFonts.H1
         $ui.Title.AutoEllipsis = $true
         $ui.Title.Location = New-Object System.Drawing.Point($x0, (S 18))
-        $ui.Title.Size = New-Object System.Drawing.Size(($cw - (S 90)), (S 30))
+        $ui.Title.Size = New-Object System.Drawing.Size(($cw - (S 90)), (S 34))
         $main.Controls.Add($ui.Title)
 
         $btnDel = New-Object AILimitsUI.RoundButton
@@ -3068,21 +3135,23 @@ function Show-Settings {
         $ui.BtnDel = $btnDel
 
         $ui.TypeLabel = New-Object System.Windows.Forms.Label
-        $ui.TypeLabel.ForeColor = $DlgColors.Faint
-        $ui.TypeLabel.Location = New-Object System.Drawing.Point($x0, (S 52))
-        $ui.TypeLabel.Size = New-Object System.Drawing.Size($cw, (S 20))
+        $ui.TypeLabel.ForeColor = $DlgColors.Muted
+        $ui.TypeLabel.Location = New-Object System.Drawing.Point($x0, (S 54))
+        $ui.TypeLabel.Size = New-Object System.Drawing.Size($cw, (S 22))
         $main.Controls.Add($ui.TypeLabel)
 
         $ui.Hint = New-Object System.Windows.Forms.Label
-        $ui.Hint.ForeColor = $DlgColors.Muted
-        $ui.Hint.Location = New-Object System.Drawing.Point($x0, (S 80))
+        $ui.Hint.ForeColor = $DlgColors.Text
+        $ui.Hint.Font = $DlgFonts.Small
+        $ui.Hint.Location = New-Object System.Drawing.Point($x0, (S 86))
         $ui.Hint.Size = New-Object System.Drawing.Size($cw, (S 60))
         $main.Controls.Add($ui.Hint)
 
         foreach ($fk in $FieldDefs.Keys) {
             $l = New-Object System.Windows.Forms.Label
             $l.Text = $FieldDefs[$fk]
-            $l.ForeColor = $DlgColors.Muted
+            $l.ForeColor = $DlgColors.Text
+            $l.Font = $DlgFonts.Label
             $l.AutoSize = $true
             $l.Location = New-Object System.Drawing.Point($x0, 0)
             $main.Controls.Add($l)
@@ -3112,7 +3181,7 @@ function Show-Settings {
         $ui.Cents = New-Object System.Windows.Forms.CheckBox
         $ui.Cents.Text = 'Report amounts are in cents (check vs Console)'
         $ui.Cents.Location = New-Object System.Drawing.Point($x0, 0)
-        $ui.Cents.Size = New-Object System.Drawing.Size($cw, (S 26))
+        $ui.Cents.Size = New-Object System.Drawing.Size($cw, (S 30))
         $ui.Cents.Add_CheckedChanged({
             if ($script:loadingFields) { return }
             $i = $script:ui.List.SelectedIndex
@@ -3123,7 +3192,7 @@ function Show-Settings {
         $ui.AutoRefresh = New-Object System.Windows.Forms.CheckBox
         $ui.AutoRefresh.Text = 'Renew the Claude Code sign-in automatically'
         $ui.AutoRefresh.Location = New-Object System.Drawing.Point($x0, 0)
-        $ui.AutoRefresh.Size = New-Object System.Drawing.Size($cw, (S 26))
+        $ui.AutoRefresh.Size = New-Object System.Drawing.Size($cw, (S 30))
         $ui.AutoRefresh.Add_CheckedChanged({
             if ($script:loadingFields) { return }
             $i = $script:ui.List.SelectedIndex
@@ -3136,7 +3205,7 @@ function Show-Settings {
             $b = New-Object AILimitsUI.RoundButton
             $b.Text = $spec[1]
             $b.Tag = $spec[0]
-            $b.Size = New-Object System.Drawing.Size((S $spec[2]), (S 32))
+            $b.Size = New-Object System.Drawing.Size((S ($spec[2] + 16)), (S 34))
             $b.Location = New-Object System.Drawing.Point($x0, 0)
             $b.Visible = $false
             $b.Add_Click({
@@ -3153,61 +3222,64 @@ function Show-Settings {
         $ui.Spacer.Location = New-Object System.Drawing.Point($x0, 0)
         $main.Controls.Add($ui.Spacer)
 
-        # ---- bottom: general options, then Cancel / Save ----
+        # ---- bottom: general options in one row (laid out by measured width), then Cancel / Save ----
         [void](New-Hairline $f 0 $FootY $FormW)
-        $gy = $FootY + (S 18)
-        $li = New-Object System.Windows.Forms.Label
-        $li.Text = 'Refresh every'
-        $li.ForeColor = $DlgColors.Muted
-        $li.AutoSize = $true
-        $li.Location = New-Object System.Drawing.Point((S 20), ($gy + (S 4)))
-        $f.Controls.Add($li)
+        $cy = $FootY + (S 36)          # vertical centre of the options row
+        $fx = S 24
+        $place = {
+            param($ctl, [int]$gap)
+            $ctl.Location = New-Object System.Drawing.Point($fx, [int]($cy - $ctl.Height / 2))
+            $f.Controls.Add($ctl)
+            $script:footX = $fx + $ctl.Width + $gap
+        }
+        $mkLabel = {
+            param([string]$text)
+            $l = New-Object System.Windows.Forms.Label
+            $l.Text = $text
+            $l.Font = $DlgFonts.Body
+            $l.ForeColor = $DlgColors.Text
+            $l.AutoSize = $true
+            $l
+        }
+        $li = & $mkLabel 'Refresh every'
+        & $place $li (S 8); $fx = $script:footX
 
-        $nudBox = New-FieldBox (S 52)
+        $nudBox = New-FieldBox (S 56)
         $nud = $nudBox.Box
         $nud.Text = [string]([math]::Max(1, [math]::Min(120, [int]$script:cfg.interval)))
         $nud.TextAlign = 'Center'
         $nud.MaxLength = 3
         $nud.Add_KeyPress({ if (-not [char]::IsDigit($_.KeyChar) -and -not [char]::IsControl($_.KeyChar)) { $_.Handled = $true } })
-        $nudBox.Frame.Location = New-Object System.Drawing.Point((S 112), ($gy - (S 3)))
-        $f.Controls.Add($nudBox.Frame)
+        & $place $nudBox.Frame (S 8); $fx = $script:footX
 
-        $lm = New-Object System.Windows.Forms.Label
-        $lm.Text = 'min'
-        $lm.ForeColor = $DlgColors.Muted
-        $lm.AutoSize = $true
-        $lm.Location = New-Object System.Drawing.Point((S 168), ($gy + (S 4)))
-        $f.Controls.Add($lm)
+        $lm = & $mkLabel 'min'
+        & $place $lm (S 32); $fx = $script:footX
 
-        $lh = New-Object System.Windows.Forms.Label
-        $lh.Text = 'Hotkey'
-        $lh.ForeColor = $DlgColors.Muted
-        $lh.AutoSize = $true
-        $lh.Location = New-Object System.Drawing.Point((S 214), ($gy + (S 4)))
-        $f.Controls.Add($lh)
+        $lh = & $mkLabel 'Hotkey'
+        & $place $lh (S 8); $fx = $script:footX
 
-        $hkBox = New-FieldBox (S 110)
+        $hkBox = New-FieldBox (S 120)
         $hk = $hkBox.Box
         $hk.Text = [string]$script:cfg.hotkey
         $hk.Font = $DlgFonts.Mono
-        $hkBox.Frame.Location = New-Object System.Drawing.Point((S 262), ($gy - (S 3)))
-        $f.Controls.Add($hkBox.Frame)
+        $hk.Top = [int](((S 36) - $hk.PreferredHeight) / 2)
+        & $place $hkBox.Frame (S 32); $fx = $script:footX
 
         $auto = New-Object System.Windows.Forms.CheckBox
         $auto.Text = 'Start with Windows'
-        $auto.Location = New-Object System.Drawing.Point((S 400), ($gy - (S 1)))
-        $auto.Size = New-Object System.Drawing.Size((S 160), (S 28))
+        $auto.Font = $DlgFonts.Body
+        $auto.AutoSize = $true
         $auto.Checked = (Test-Path $StartupLnk)
-        $f.Controls.Add($auto)
+        & $place $auto (S 24); $fx = $script:footX
 
         $ah = New-Object System.Windows.Forms.CheckBox
         $ah.Text = 'Hide in games / fullscreen'
-        $ah.Location = New-Object System.Drawing.Point((S 566), ($gy - (S 1)))
-        $ah.Size = New-Object System.Drawing.Size((S 200), (S 28))
+        $ah.Font = $DlgFonts.Body
+        $ah.AutoSize = $true
         $ah.Checked = [bool]$script:cfg.autoHide
-        $f.Controls.Add($ah)
+        & $place $ah 0
 
-        [void](New-Hairline $f 0 ($FootY + (S 60)) $FormW)
+        [void](New-Hairline $f 0 ($FootY + (S 72)) $FormW)
 
         $ok = New-Object AILimitsUI.RoundButton
         $ok.Text = 'Save'
@@ -3757,142 +3829,88 @@ function Update-FullscreenState {
     if ($script:cfg.autoHide -and $form.Visible) {
         try { $want = [AILimitsUI.Win]::FullscreenOnMyMonitor($form.Handle) } catch { $want = $false }
     }
-    if ($want -ne $script:suppressed) { $script:suppressed = $want; Update-Visual }
+    if ($want -ne $script:suppressed) { $script:suppressed = $want; Update-Visual -Recapture }
 }
 
-# ---------- statistics window: API value from logs, charts, limit history ----------
-$StatsInk = @{ Text = (New-Rgb '#121212'); Muted = (New-Rgb '#55554F'); Faint = (New-Rgb '#6B6B66'); Grid = (New-Rgb '#ECEBE7'); Rule = (New-Rgb '#E3E2DD'); Axis = (New-Rgb '#B9B8B2'); Blue = (New-Rgb '#2a78d6'); Orange = (New-Rgb '#eb6834'); Surface = (New-Rgb '#FAFAF8'); Bar = (New-Rgb '#121212') }
+# ---------- statistics window: dashboard layout (sidebar, KPI cards, chart, table, limit cards) ----------
+$StatsInk = @{
+    Text = (New-Rgb '#111111'); Second = (New-Rgb '#444444'); Muted = (New-Rgb '#6B6B6B'); Axis = (New-Rgb '#767676')
+    Border = (New-Rgb '#E3E3E3'); Soft = (New-Rgb '#ECECEC'); Strip = (New-Rgb '#F6F6F6'); Tile = (New-Rgb '#F4F4F4')
+    Grid = (New-Rgb '#F0F0F0'); Base = (New-Rgb '#E2E2E2'); Line = (New-Rgb '#A3A3A3'); Hatch = (New-Rgb '#D2D2D2')
+    BarIdle = (New-Rgb '#C4C4C4'); Surface = (New-Rgb '#FFFFFF'); Side = (New-Rgb '#F6F6F6'); Sel = (New-Rgb '#E9E9E9')
+    Ok = (New-Rgb '#1F8A4C'); Off = (New-Rgb '#C9C9C9'); Accent = (New-Rgb '#E8622C')
+}
 $StatsFont = @{
-    H1 = New-PxFont $FontNumSemi 22
-    H2 = New-PxFont 'Segoe UI Semibold' 12
-    Kpi = New-PxFont $FontNum 30
-    Caps = New-PxFont 'Segoe UI Semibold' 10
-    Small = New-PxFont 'Segoe UI' 11
-    Body = New-PxFont 'Segoe UI' 12
+    H1 = New-PxFont $FontUi 24
+    H2 = New-PxFont $FontUiSemi 14
+    Kpi = New-PxFont $FontUi 26
+    Body = New-PxFont $FontUi 13
+    Label = New-PxFont $FontUi 12
+    Small = New-PxFont $FontUi 11
     Mono = New-PxFont $FontMono 12
+    Nav = New-PxFont $FontUi 13
+    NavSemi = New-PxFont $FontUiSemi 13
 }
 
+# text on the opaque white bitmap: ClearType is crisper than grayscale here
 function SDraw($g, [string]$s, $font, $color, [single]$x, [single]$y, [string]$align = 'left') {
-    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
     $sz = $g.MeasureString($s, $font, [System.Drawing.PointF]::new(0, 0), $TypoFormat)
     if ($align -eq 'right') { $x -= $sz.Width } elseif ($align -eq 'center') { $x -= $sz.Width / 2 }
     $br = New-Object System.Drawing.SolidBrush($color)
-    $g.DrawString($s, $font, $br, $x, $y, $TypoFormat)
+    $g.DrawString($s, $font, $br, [single][math]::Round($x), [single][math]::Round($y), $TypoFormat)
     $br.Dispose()
     $sz
+}
+# draw by baseline so mixed sizes line up
+function SBase($g, [string]$s, $font, $color, [single]$x, [single]$base, [string]$align = 'left') {
+    SDraw $g $s $font $color $x ($base - (Get-Ascent $font)) $align
 }
 
 function Format-Money([double]$v) {
     if ($v -ge 100) { return ('${0:N0}' -f $v) }
-    if ($v -ge 1) { return ('${0:N2}' -f $v) }
-    if ($v -gt 0) { return ('${0:N3}' -f $v) }
+    if ($v -ge 0.01) { return ('${0:N2}' -f $v) }
+    if ($v -gt 0) { return '<$0.01' }
     '$0'
 }
+function Format-Big([double]$v) {
+    if ($v -ge 1e9) { return ('{0:N1}B' -f ($v / 1e9)) }
+    if ($v -ge 1e6) { return ('{0:N0}M' -f ($v / 1e6)) }
+    if ($v -ge 1e3) { return ('{0:N0}K' -f ($v / 1e3)) }
+    '{0:N0}' -f $v
+}
 
+# Top of a 4-step axis with round steps ($15 · $30 · $45 · $60 rather than $12.50 · $37.50)
 function Get-NiceMax([double]$v) {
-    if ($v -le 0) { return 1.0 }
-    $e = [math]::Pow(10, [math]::Floor([math]::Log10($v)))
-    foreach ($m in 1, 2, 2.5, 5, 10) { if ($m * $e -ge $v) { return $m * $e } }
-    10 * $e
+    if ($v -le 0) { return 4.0 }
+    $raw = $v / 4
+    $e = [math]::Pow(10, [math]::Floor([math]::Log10($raw)))
+    foreach ($m in 1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10) { if ($m * $e -ge $raw - 1e-9) { return 4 * $m * $e } }
+    40 * $e
+}
+function Format-Axis([double]$v) {
+    if ($v -eq 0) { return '$0' }
+    if ([math]::Abs($v - [math]::Round($v)) -lt 1e-9) { return ('${0:N0}' -f $v) }
+    '${0:N2}' -f $v
 }
 
-# Single-series column chart: one hue, 4px rounded data end on the baseline side, recessive grid, hover text per column.
-function Draw-Columns($g, [single]$x, [single]$y, [single]$w, [single]$h, [double[]]$vals, [string[]]$labels, [string[]]$tips) {
-    $axisW = S 46
-    $px = $x + $axisW; $pw = $w - $axisW; $ph = $h - (S 20)
-    $max = Get-NiceMax (($vals | Measure-Object -Maximum).Maximum)
-    $pen = New-Object System.Drawing.Pen($StatsInk.Grid, 1)
-    foreach ($f in 0, 0.5, 1) {
-        $gy = [math]::Round($y + $ph - $ph * $f) + 0.5
-        $g.DrawLine($pen, $px, $gy, $x + $w, $gy)
-        [void](SDraw $g (Format-Money ($max * $f)) $StatsFont.Small $StatsInk.Muted ($px - (S 6)) ($gy - (S 8)) 'right')
-    }
+function SCard($g, [single]$x, [single]$y, [single]$w, [single]$h, $fill, $border, [single]$r = (S 12)) {
+    $p = New-RoundPath ($x + 0.5) ($y + 0.5) ($w - 1) ($h - 1) $r
+    if ($fill) { $b = New-Object System.Drawing.SolidBrush($fill); $g.FillPath($b, $p); $b.Dispose() }
+    if ($border) { $pen = New-Object System.Drawing.Pen($border, 1); $g.DrawPath($pen, $p); $pen.Dispose() }
+    $p.Dispose()
+}
+
+function SRule($g, $color, [single]$x1, [single]$x2, [single]$y, [switch]$Dashed) {
+    $pen = New-Object System.Drawing.Pen($color, 1)
+    if ($Dashed) { $pen.DashPattern = [single[]]@(3, 3) }
+    $yy = [single]([math]::Round($y) + 0.5)
+    $g.DrawLine($pen, $x1, $yy, $x2, $yy)
     $pen.Dispose()
-    $n = $vals.Count
-    $slot = $pw / $n
-    $bw = [math]::Max((S 3), $slot - (S 2) - [math]::Min((S 10), $slot * 0.3))
-    $br = New-Object System.Drawing.SolidBrush($StatsInk.Blue)
-    $old = $g.Clip
-    $g.SetClip((New-Object System.Drawing.RectangleF($px, ($y - 2), $pw, ($ph + 2))))
-    for ($i = 0; $i -lt $n; $i++) {
-        $bx = $px + $i * $slot + ($slot - $bw) / 2
-        $bh = [single]($ph * $vals[$i] / $max)
-        $script:statsHits += @{ Rect = (New-Object System.Drawing.RectangleF(($px + $i * $slot), $y, $slot, $ph)); Text = $tips[$i] }
-        if ($bh -le 0) { continue }
-        $r = [math]::Min((S 4), $bw / 2)
-        $path = New-RoundPath $bx ($y + $ph - $bh) $bw ($bh + $r) $r
-        $g.FillPath($br, $path)
-        $path.Dispose()
-    }
-    $g.Clip = $old
-    $br.Dispose()
-    $ap = New-Object System.Drawing.Pen($StatsInk.Axis, 1)
-    $ay = [math]::Round($y + $ph) + 0.5
-    $g.DrawLine($ap, $px, $ay, $x + $w, $ay); $ap.Dispose()
-    for ($i = 0; $i -lt $n; $i++) {
-        if (-not $labels[$i]) { continue }
-        [void](SDraw $g $labels[$i] $StatsFont.Small $StatsInk.Muted ($px + $i * $slot + $slot / 2) ($y + $ph + (S 5)) 'center')
-    }
-}
-
-# Two-series line chart on one 0–100% axis, 2px lines, legend plus direct labels at the line ends.
-function Draw-LimitLines($g, [single]$x, [single]$y, [single]$w, [single]$h, $series, [int64]$t0, [int64]$t1) {
-    $axisW = S 46
-    $px = $x + $axisW; $pw = $w - $axisW - (S 90); $ph = $h - (S 20)
-    $pen = New-Object System.Drawing.Pen($StatsInk.Grid, 1)
-    foreach ($f in 0, 0.5, 1) {
-        $gy = [math]::Round($y + $ph - $ph * $f) + 0.5
-        $g.DrawLine($pen, $px, $gy, $px + $pw, $gy)
-        [void](SDraw $g ('{0}%' -f [int](100 * $f)) $StatsFont.Small $StatsInk.Muted ($px - (S 6)) ($gy - (S 8)) 'right')
-    }
-    $pen.Dispose()
-    for ($d = 0; $d -le 7; $d++) {
-        $tt = $t1 - (7 - $d) * 86400
-        $lx = $px + $pw * ($tt - $t0) / ($t1 - $t0)
-        $lbl = [DateTimeOffset]::FromUnixTimeSeconds($tt).ToLocalTime().ToString('ddd')
-        if ($d -lt 7) { [void](SDraw $g $lbl $StatsFont.Small $StatsInk.Muted $lx ($y + $ph + (S 5)) 'center') }
-    }
-    $g.SmoothingMode = 'AntiAlias'
-    foreach ($s in $series) {
-        $pts = @($s.Pts)
-        if ($pts.Count -lt 1) { continue }
-        $lp = New-Object System.Drawing.Pen($s.Color, (S 2))
-        $lp.LineJoin = 'Round'
-        $arr = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
-        foreach ($pt in $pts) { $arr.Add([System.Drawing.PointF]::new(($px + $pw * ($pt[0] - $t0) / ($t1 - $t0)), ($y + $ph - $ph * [math]::Min(100, $pt[1]) / 100))) }
-        if ($arr.Count -ge 2) { $g.DrawLines($lp, $arr.ToArray()) }
-        $lastP = $arr[$arr.Count - 1]
-        $dot = New-Object System.Drawing.SolidBrush($s.Color)
-        $g.FillEllipse($dot, $lastP.X - (S 4), $lastP.Y - (S 4), (S 8), (S 8))
-        $dot.Dispose(); $lp.Dispose()
-        [void](SDraw $g ('{0} {1}%' -f $s.Name, [int][math]::Round($pts[-1][1])) $StatsFont.Small $StatsInk.Text ($lastP.X + (S 8)) ($lastP.Y - (S 8)))
-    }
-}
-
-function Draw-TopList($g, [single]$x, [single]$y, [single]$w, $items, [int]$rows) {
-    $list = @($items | Select-Object -First $rows)
-    if (-not $list) { [void](SDraw $g 'No data yet' $StatsFont.Body $StatsInk.Muted $x $y); return }
-    $max = [math]::Max(0.0001, [double]$list[0].Value)
-    $br = New-Object System.Drawing.SolidBrush($StatsInk.Bar)
-    $tr = New-Object System.Drawing.SolidBrush($StatsInk.Grid)
-    $rp = New-Object System.Drawing.Pen($StatsInk.Grid, 1)
-    $nameW = [math]::Min((S 150), $w * 0.42); $valW = S 70
-    $bx = $x + $nameW + (S 10); $bw = $w - $nameW - $valW - (S 20)
-    foreach ($it in $list) {
-        $name = [string]$it.Key
-        if ($name.Length -gt 22) { $name = $name.Substring(0, 21) + '…' }
-        [void](SDraw $g $name $StatsFont.Body $StatsInk.Text $x ($y + (S 5)))
-        $g.FillRectangle($tr, $bx, $y + (S 11), $bw, (S 6))
-        $g.FillRectangle($br, $bx, $y + (S 11), [single][math]::Max((S 2), $bw * [double]$it.Value / $max), (S 6))
-        [void](SDraw $g (Format-Money ([double]$it.Value)) $StatsFont.Mono $StatsInk.Text ($x + $w) ($y + (S 5)) 'right')
-        $y += S 28
-        $ly = [math]::Round($y) - 0.5
-        $g.DrawLine($rp, $x, $ly, $x + $w, $ly)
-    }
-    $br.Dispose(); $tr.Dispose(); $rp.Dispose()
 }
 
 function Get-StatsPlan($prov) {
+    if ($prov.planPrice) { try { return [double]$prov.planPrice } catch { } }
     foreach ($r in @($script:results)) {
         if ($r.Id -ne $prov.id) { continue }
         foreach ($ln in @($r.Lines)) { if ([string]$ln.Label -match '^vs \$([\d,\.]+) plan$') { return [double]($matches[1] -replace ',', '') } }
@@ -3900,202 +3918,682 @@ function Get-StatsPlan($prov) {
     0.0
 }
 
-function Render-Stats($prov) {
-    $script:statsHits = @()
-    $W = S 720
-    $H = S 900
+# daily peak of each limit from the widget's own history, last 7 days (oldest first)
+function Get-LimitPeaks($prov) {
+    $peaks = [ordered]@{}
+    $hf = Join-Path $AppDir ('history-' + $prov.id + '.tsv')
+    if (-not (Test-Path $hf)) { return $peaks }
+    $today = [DateTime]::Today
+    foreach ($ln in Get-Content $hf) {
+        $a = $ln.TrimStart([char]0xFEFF).Split("`t")
+        if ($a.Count -lt 3) { continue }
+        $ts = [int64]0; $v = 0.0
+        if (-not [int64]::TryParse($a[0], [ref]$ts)) { continue }
+        if (-not [double]::TryParse($a[2], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$v)) { continue }
+        $d = [DateTimeOffset]::FromUnixTimeSeconds($ts).ToLocalTime().Date
+        $idx = 6 - [int]($today - $d).TotalDays
+        if ($idx -lt 0 -or $idx -gt 6) { continue }
+        if (-not $peaks.Contains($a[1])) { $peaks[$a[1]] = New-Object double[] 7 }
+        if ($v -gt $peaks[$a[1]][$idx]) { $peaks[$a[1]][$idx] = $v }
+    }
+    $peaks
+}
+
+# Smooth line through day values (monotone-ish cubic: control points flat at each sample, no overshoot)
+function Get-SmoothPath([System.Drawing.PointF[]]$pts) {
+    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+    for ($i = 0; $i -lt $pts.Count - 1; $i++) {
+        $a = $pts[$i]; $b = $pts[$i + 1]; $mx = ($a.X + $b.X) / 2
+        $path.AddBezier($a, [System.Drawing.PointF]::new($mx, $a.Y), [System.Drawing.PointF]::new($mx, $b.Y), $b)
+    }
+    $path
+}
+
+function Draw-ValueChart($g, [single]$x, [single]$y, [single]$w, [single]$h, $sum, [string]$period = 'month') {
+    $now = [DateTime]::Now
+    $dim = [DateTime]::DaysInMonth($now.Year, $now.Month)
+    $prev = $now.AddMonths(-1)
+    $pdim = [DateTime]::DaysInMonth($prev.Year, $prev.Month)
+    $cur = New-Object double[] $now.Day
+    $old = New-Object double[] $pdim
+    if ($sum) {
+        for ($i = 0; $i -lt $now.Day; $i++) { $cur[$i] = $sum.MonthDays[$i] }
+        for ($i = 0; $i -lt $pdim; $i++) { $old[$i] = $sum.PrevDays[$i] }
+    }
+    if ($period -eq 'prev') {
+        # last month on its own: it becomes the solid series, nothing to compare against
+        $cur = $old; $old = New-Object double[] 0; $dim = $pdim; $now = $prev
+    }
+    $mx = 0.0
+    foreach ($v in $cur + $old) { if ($v -gt $mx) { $mx = $v } }
+    $max = Get-NiceMax $mx
+    $axisW = S 40
+    $px = $x + $axisW; $pw = $w - $axisW; $ph = $h - (S 22)
+    for ($k = 0; $k -le 4; $k++) {
+        $gy = $y + $ph - $ph * $k / 4
+        $col = $(if ($k -eq 0) { $StatsInk.Base } else { $StatsInk.Grid })
+        SRule $g $col $px ($px + $pw) $gy
+        [void](SBase $g (Format-Axis ($max * $k / 4)) $StatsFont.Small $StatsInk.Axis $x ($gy + (S 4)))
+    }
+    $xAt = { param([double]$day) $px + $pw * ($day - 1) / [math]::Max(1, $dim - 1) }
+    $yAt = { param([double]$v) $y + $ph - $ph * [math]::Min(1, $v / $max) }
+    $g.SmoothingMode = 'AntiAlias'
+    # last month: black dashed
+    if ($old.Count -ge 2) {
+        $pts = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+        for ($i = 0; $i -lt [math]::Min($pdim, $dim); $i++) { $pts.Add([System.Drawing.PointF]::new((& $xAt ($i + 1)), (& $yAt $old[$i]))) }
+        $path = Get-SmoothPath $pts.ToArray()
+        $pen = New-Object System.Drawing.Pen($StatsInk.Text, [single](S 1.6))
+        $pen.DashPattern = [single[]]@(2.5, 2.5)
+        $g.DrawPath($pen, $path); $pen.Dispose(); $path.Dispose()
+    }
+    # this month: grey line with a hatched area
+    if ($cur.Count -ge 1) {
+        $pts = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+        for ($i = 0; $i -lt $cur.Count; $i++) { $pts.Add([System.Drawing.PointF]::new((& $xAt ($i + 1)), (& $yAt $cur[$i]))) }
+        if ($pts.Count -eq 1) { $pts.Add([System.Drawing.PointF]::new($pts[0].X + 1, $pts[0].Y)) }
+        $line = Get-SmoothPath $pts.ToArray()
+        $area = $line.Clone()
+        $area.AddLine($pts[$pts.Count - 1], [System.Drawing.PointF]::new($pts[$pts.Count - 1].X, ($y + $ph)))
+        $area.AddLine([System.Drawing.PointF]::new($pts[$pts.Count - 1].X, ($y + $ph)), [System.Drawing.PointF]::new($pts[0].X, ($y + $ph)))
+        $area.CloseFigure()
+        $hb = New-Object System.Drawing.Drawing2D.HatchBrush([System.Drawing.Drawing2D.HatchStyle]::WideUpwardDiagonal, $StatsInk.Hatch, [System.Drawing.Color]::Transparent)
+        $g.FillPath($hb, $area); $hb.Dispose(); $area.Dispose()
+        $pen = New-Object System.Drawing.Pen($StatsInk.Line, [single](S 2))
+        $pen.LineJoin = 'Round'
+        $g.DrawPath($pen, $line); $pen.Dispose(); $line.Dispose()
+        $last = $pts[$cur.Count - 1]
+        $db = New-Object System.Drawing.SolidBrush($StatsInk.Text)
+        $g.FillEllipse($db, $last.X - (S 3.5), $last.Y - (S 3.5), (S 7), (S 7)); $db.Dispose()
+    }
+    # x labels and hover regions per day
+    foreach ($d in 1, 5, 9, 13, 17, 21, 25, $dim) {
+        if ($d -gt $dim -or ($d -ne $dim -and $dim - $d -lt 3)) { continue }
+        $lbl = $(if ($d -eq 1 -or $d -eq $dim) { '{0} {1}' -f $d, $now.ToString('MMM', [Globalization.CultureInfo]::InvariantCulture) } else { [string]$d })
+        $al = $(if ($d -eq 1) { 'left' } elseif ($d -eq $dim) { 'right' } else { 'center' })
+        [void](SDraw $g $lbl $StatsFont.Small $StatsInk.Axis (& $xAt $d) ($y + $ph + (S 7)) $al)
+    }
+    $slot = $pw / [math]::Max(1, $dim - 1)
+    for ($d = 1; $d -le $dim; $d++) {
+        $cv = $(if ($d -le $cur.Count) { Format-Money $cur[$d - 1] } else { '—' })
+        $tipTxt = '{0} {1}: {2}' -f $d, $now.ToString('MMM', [Globalization.CultureInfo]::InvariantCulture), $cv
+        if ($old.Count) {
+            $ov = $(if ($d -le $old.Count) { Format-Money $old[$d - 1] } else { '—' })
+            $tipTxt += '   ·   {0}: {1}' -f $prev.ToString('MMM', [Globalization.CultureInfo]::InvariantCulture), $ov
+        }
+        $script:statsHits += @{ Rect = (New-Object System.Drawing.RectangleF(((& $xAt $d) - $slot / 2), $y, $slot, $ph)); Text = $tipTxt }
+    }
+}
+
+# Reading the usage log on every click would make the window sluggish with a big log,
+# so the summary is kept for a minute (Refresh and every background update clear it).
+function Get-StatsSummary($prov) {
+    $u = $script:statsUi
+    $key = [string]$prov.id
+    if ($u -and $u.SumCache -and $u.SumCache.ContainsKey($key)) {
+        $c = $u.SumCache[$key]
+        if (([DateTime]::Now - $c.At).TotalSeconds -lt 60) { return $c.Sum }
+    }
+    $sum = $null
+    try { $sum = [AILimitsUI.UsageLog]::Summarize($prov.id, (Join-Path $AppDir 'usage'), $PricingPath, [DateTime]::Now) } catch { Write-Log "stats: $_" }
+    if ($u -and $sum) { if (-not $u.SumCache) { $u.SumCache = @{} }; $u.SumCache[$key] = @{ Sum = $sum; At = [DateTime]::Now } }
+    $sum
+}
+
+# The sections below read $pad, $cw, $gap, $sum, $prov, $now, $period and $prevName from Render-Stats (caller scope).
+function Draw-StatsKpis($g, [single]$y) {
+    # ---- KPI cards: label + value on the left, a grey panel with context on the right ----
+    $plan = Get-StatsPlan $prov
+    $month = 0.0; $today = 0.0; $req = 0.0; $tok = 0.0; $prevM = 0.0; $treq = 0
+    if ($sum) { $month = $sum.MonthCost; $today = $sum.TodayCost; $req = $sum.MonthRequests; $tok = $sum.MonthTokens; $prevM = $sum.PrevMonthCost; $treq = $sum.TodayRequests }
+    $avg = $month / [math]::Max(1, $now.Day)
+    $prevName = $now.AddMonths(-1).ToString('MMM', [Globalization.CultureInfo]::InvariantCulture)
+    $kpis = @(
+        @('API value, month', (Format-Money $month), ('{0} {1}' -f $prevName, (Format-Money $prevM))),
+        @('Today', (Format-Money $today), ('{0} req' -f [int]$treq)),
+        @('Value vs plan', $(if ($plan -gt 0) { '{0:N1}×' -f ($month / $plan) } else { '—' }), $(if ($plan -gt 0) { '${0:N0}/mo' -f $plan } else { 'no plan' })),
+        @('Requests', ('{0:N0}' -f $req), ('{0} tok' -f (Format-Big $tok)))
+    )
+    $gap = S 12; $kw = ($cw - 3 * $gap) / 4; $kh = S 78; $tileW = S 78
+    for ($i = 0; $i -lt 4; $i++) {
+        $kx = $pad + $i * ($kw + $gap)
+        SCard $g $kx $y $kw $kh $StatsInk.Surface $null
+        # grey side panel, clipped to the card's rounded corners
+        $clip = New-RoundPath ($kx + 0.5) ($y + 0.5) ($kw - 1) ($kh - 1) (S 12)
+        $oldClip = $g.Clip; $g.SetClip($clip)
+        $tb = New-Object System.Drawing.SolidBrush($StatsInk.Tile); $g.FillRectangle($tb, ($kx + $kw - $tileW), $y, $tileW, $kh); $tb.Dispose()
+        $g.Clip = $oldClip; $clip.Dispose()
+        $sp = New-Object System.Drawing.Pen($StatsInk.Soft, 1); $g.DrawLine($sp, [single]([math]::Round($kx + $kw - $tileW) + 0.5), $y, [single]([math]::Round($kx + $kw - $tileW) + 0.5), $y + $kh); $sp.Dispose()
+        SCard $g $kx $y $kw $kh $null $StatsInk.Border
+        [void](SBase $g $kpis[$i][0] $StatsFont.Label $StatsInk.Second ($kx + (S 14)) ($y + (S 26)))
+        [void](SBase $g $kpis[$i][1] $StatsFont.Kpi $StatsInk.Text ($kx + (S 14)) ($y + (S 62)))
+        [void](SDraw $g $kpis[$i][2] $StatsFont.Small $StatsInk.Second ($kx + $kw - $tileW / 2) ($y + $kh / 2 - (S 8)) 'center')
+    }
+    $kh
+}
+
+function Draw-StatsChart($g, [single]$x, [single]$y, [single]$lw, [single]$rowH) {
+        SCard $g $x $y $lw $rowH $StatsInk.Surface $StatsInk.Border
+    [void](SBase $g 'API value per day' $StatsFont.H2 $StatsInk.Text ($x + (S 16)) ($y + (S 30)))
+    # period chip: a real switch between this month (vs last month) and last month on its own
+    $ci = [Globalization.CultureInfo]::InvariantCulture
+    if ($period -eq 'prev') { $chip = '{0} (whole month)' -f $now.AddMonths(-1).ToString('MMMM', $ci) }
+    else { $chip = '1 – {0} {1}' -f $now.Day, $now.ToString('MMM', $ci) }
+    $chW = (Measure-Str $chip $StatsFont.Label).Width + (S 40)
+    $chX = $x + $lw - (S 16) - $chW
+    SCard $g $chX ($y + (S 13)) $chW (S 26) $null (New-Rgb '#D6D6D6') (S 7)
+    [void](SBase $g $chip $StatsFont.Label $StatsInk.Text ($chX + (S 11)) ($y + (S 30)))
+    # small swap arrows show it can be clicked
+    $ap = New-Object System.Drawing.Pen($StatsInk.Second, [single](S 1.2))
+    $axc = $chX + $chW - (S 16); $ayc = $y + (S 26)
+    $g.DrawLines($ap, [System.Drawing.PointF[]]@([System.Drawing.PointF]::new(($axc - (S 3)), ($ayc - (S 2))), [System.Drawing.PointF]::new($axc, ($ayc - (S 5))), [System.Drawing.PointF]::new(($axc + (S 3)), ($ayc - (S 2)))))
+    $g.DrawLines($ap, [System.Drawing.PointF[]]@([System.Drawing.PointF]::new(($axc - (S 3)), ($ayc + (S 2))), [System.Drawing.PointF]::new($axc, ($ayc + (S 5))), [System.Drawing.PointF]::new(($axc + (S 3)), ($ayc + (S 2)))))
+    $ap.Dispose()
+    $script:statsClicks += @{ Rect = (New-Object System.Drawing.RectangleF($chX, ($y + (S 13)), $chW, (S 26))); Action = 'period'; Tip = 'Switch between this month and last month' }
+    # legend
+    $lx = $chX - (S 14)
+    if ($period -ne 'prev') {
+        $lsz = Measure-Str $prevName $StatsFont.Small
+        $lx -= $lsz.Width; [void](SBase $g $prevName $StatsFont.Small $StatsInk.Second $lx ($y + (S 30)))
+        $dp = New-Object System.Drawing.Pen($StatsInk.Text, [single](S 1.6)); $dp.DashPattern = [single[]]@(2, 2)
+        $g.DrawLine($dp, $lx - (S 20), $y + (S 26), $lx - (S 6), $y + (S 26)); $dp.Dispose()
+        $lx -= S 32
+    }
+    $curName = $(if ($period -eq 'prev') { $prevName } else { $now.ToString('MMM', $ci) })
+    $lsz = Measure-Str $curName $StatsFont.Small
+    $lx -= $lsz.Width; [void](SBase $g $curName $StatsFont.Small $StatsInk.Second $lx ($y + (S 30)))
+    $lp = New-Object System.Drawing.Pen($StatsInk.Line, [single](S 2))
+    $g.DrawLine($lp, $lx - (S 20), $y + (S 26), $lx - (S 6), $y + (S 26)); $lp.Dispose()
+    Draw-ValueChart $g ($x + (S 16)) ($y + (S 58)) ($lw - (S 32)) ($rowH - (S 74)) $sum $period
+
+}
+
+function Draw-StatsTable($g, [single]$tx, [single]$y, [single]$rw, [single]$rowH, [int]$maxRows) {
+    # table card: Projects / Models toggle
+    SCard $g $tx $y $rw $rowH $StatsInk.Surface $StatsInk.Border
+    $mode = $script:statsMode
+    $title = $(if ($mode -eq 'models') { 'Top models' } else { 'Top projects' })
+    [void](SBase $g $title $StatsFont.H2 $StatsInk.Text ($tx + (S 16)) ($y + (S 30)))
+    $segW = S 150; $segX = $tx + $rw - (S 16) - $segW; $segY = $y + (S 13)
+    SCard $g $segX $segY $segW (S 26) $StatsInk.Strip $StatsInk.Soft (S 7)
+    $half = $segW / 2
+    foreach ($m in @(@('projects', 'Projects', 0), @('models', 'Models', 1))) {
+        $sx = $segX + $m[2] * $half
+        if ($mode -eq $m[0]) { SCard $g ($sx + (S 2)) ($segY + (S 2)) ($half - (S 4)) (S 22) $StatsInk.Surface $StatsInk.Border (S 5) }
+        [void](SBase $g $m[1] $StatsFont.Label $(if ($mode -eq $m[0]) { $StatsInk.Text } else { $StatsInk.Second }) ($sx + $half / 2) ($segY + (S 17)) 'center')
+        $script:statsClicks += @{ Rect = (New-Object System.Drawing.RectangleF($sx, $segY, $half, (S 26))); Action = $m[0]; Tip = ('Show ' + $m[1].ToLowerInvariant()) }
+    }
+    $hy = $y + (S 62)
+    $c2 = $tx + $rw - (S 16) - (S 80) - (S 76)
+    $mid = $(if ($mode -eq 'models') { 'Share' } else { 'Model' })
+    [void](SBase $g $(if ($mode -eq 'models') { 'Model' } else { 'Project folder' }) $StatsFont.Small $StatsInk.Muted ($tx + (S 26)) $hy)
+    [void](SBase $g $mid $StatsFont.Small $StatsInk.Muted $c2 $hy)
+    [void](SBase $g 'API value' $StatsFont.Small $StatsInk.Muted ($tx + $rw - (S 26)) $hy 'right')
+    $items = @()
+    if ($sum) { if ($mode -eq 'models') { $items = @($sum.Models) } else { $items = @($sum.Projects) } }
+    $ry = $y + (S 72)
+    if ($items.Count -eq 0) {
+        [void](SDraw $g 'No Claude Code / Codex activity this month yet.' $StatsFont.Body $StatsInk.Second ($tx + (S 16)) ($ry + (S 6)))
+    }
+    $total = 0.0; foreach ($it in $items) { $total += [double]$it.Value }
+    foreach ($it in @($items | Select-Object -First $maxRows)) {
+        SCard $g ($tx + (S 16)) $ry ($rw - (S 32)) (S 32) $StatsInk.Strip $StatsInk.Soft (S 8)
+        $base = $ry + (S 21)
+        $name = [string]$it.Key
+        $maxName = $c2 - (S 12) - ($tx + (S 46))
+        $name = Fit-Str $name $StatsFont.Body $maxName
+        if ($mode -eq 'models') {
+            $mid = '{0:N0}%' -f (100 * [double]$it.Value / [math]::Max(0.0001, $total))
+        } else {
+            $mid = ''
+            if ($sum.ProjectModel.ContainsKey([string]$it.Key)) { $mid = $sum.ProjectModel[[string]$it.Key] }
+            # folder glyph
+            $fp = New-Object System.Drawing.Pen($StatsInk.Second, [single](S 1.2))
+            $fx0 = $tx + (S 27); $fy0 = $ry + (S 11)
+            $g.DrawLines($fp, [System.Drawing.PointF[]]@(
+                [System.Drawing.PointF]::new($fx0, $fy0), [System.Drawing.PointF]::new(($fx0 + (S 4)), $fy0), [System.Drawing.PointF]::new(($fx0 + (S 5.5)), ($fy0 + (S 1.5))),
+                [System.Drawing.PointF]::new(($fx0 + (S 11)), ($fy0 + (S 1.5))), [System.Drawing.PointF]::new(($fx0 + (S 11)), ($fy0 + (S 9))), [System.Drawing.PointF]::new($fx0, ($fy0 + (S 9))),
+                [System.Drawing.PointF]::new($fx0, $fy0)))
+            $fp.Dispose()
+        }
+        $nx = $(if ($mode -eq 'models') { $tx + (S 26) } else { $tx + (S 46) })
+        [void](SBase $g $name $StatsFont.Body $StatsInk.Text $nx $base)
+        [void](SBase $g (Fit-Str $mid $StatsFont.Label (S 72)) $StatsFont.Label $StatsInk.Second $c2 $base)
+        [void](SBase $g (Format-Money ([double]$it.Value)) $StatsFont.Mono $StatsInk.Text ($tx + $rw - (S 26)) $base 'right')
+        $script:statsHits += @{ Rect = (New-Object System.Drawing.RectangleF(($tx + (S 16)), $ry, ($rw - (S 32)), (S 32))); Text = ([string]$it.Key + ' · ' + (Format-Money ([double]$it.Value))) }
+        $ry += S 38
+    }
+}
+
+function Draw-StatsLimits($g, [single]$y, [switch]$Big) {
+    # ---- limits: one card per limit window with today's value and daily peaks ----
+    $lim = @()
+    foreach ($r in @($script:results)) {
+        if ($null -eq $r -or $r.Id -ne $prov.id) { continue }
+        foreach ($ln in @($r.Lines)) { if ($null -ne $ln.Pct) { $lim += $ln } }
+    }
+    $peaks = Get-LimitPeaks $prov
+    $perRow = $(if ($Big) { 1 } else { 3 })
+    $cardsH = $(if ($Big) { S 196 } else { S 128 })
+    $rowsN = [math]::Ceiling([math]::Max(1, [math]::Min($(if ($Big) { 6 } else { 3 }), $lim.Count)) / $perRow)
+    $boxH = (S 48) + $(if ($lim.Count) { $rowsN * $cardsH + ($rowsN - 1) * $gap } else { S 40 }) + (S 16)
+    SCard $g $pad $y $cw $boxH $StatsInk.Surface $StatsInk.Border
+    [void](SBase $g 'Your limits' $StatsFont.H2 $StatsInk.Text ($pad + (S 16)) ($y + (S 30)))
+    [void](SBase $g 'bars: highest reading of each day, last 7 days' $StatsFont.Label $StatsInk.Muted ($pad + $cw - (S 16)) ($y + (S 30)) 'right')
+    if (-not $lim.Count) {
+        [void](SDraw $g 'No limit readings yet for this account.' $StatsFont.Body $StatsInk.Second ($pad + (S 16)) ($y + (S 52)))
+    } else {
+        $n = [math]::Min($(if ($Big) { 6 } else { 3 }), $lim.Count)
+        $cols = [math]::Min($perRow, $n)
+        $lcw = ($cw - (S 32) - ($cols - 1) * $gap) / $cols
+        for ($i = 0; $i -lt $n; $i++) {
+            $ln = $lim[$i]
+            $cx = $pad + (S 16) + ($i % $cols) * ($lcw + $gap); $cy = $y + (S 48) + [math]::Floor($i / $cols) * ($cardsH + $gap)
+            SCard $g $cx $cy $lcw $cardsH $StatsInk.Strip $StatsInk.Soft
+            [void](SBase $g (Fit-Str ([string]$ln.Label) $StatsFont.NavSemi ($lcw - (S 90))) $StatsFont.NavSemi $StatsInk.Text ($cx + (S 14)) ($cy + (S 26)))
+            $sub = $(if ($ln.Reset) { 'resets in ' + [string]$ln.Reset } else { 'no reset time' })
+            [void](SBase $g $sub $StatsFont.Label $StatsInk.Muted ($cx + (S 14)) ($cy + (S 44)))
+            [void](SBase $g ('{0}%' -f [int][math]::Round([double]$ln.Pct)) $StatsFont.Kpi $StatsInk.Text ($cx + $lcw - (S 14)) ($cy + (S 36)) 'right')
+            # 7 daily peak bars, today in black
+            $vals = $null
+            foreach ($k in $peaks.Keys) { if ($k -eq [string]$ln.Label) { $vals = $peaks[$k] } }
+            if ($null -eq $vals) { $vals = New-Object double[] 7; $vals[6] = [double]$ln.Pct }
+            $bx0 = $cx + (S 14); $bw0 = $lcw - (S 28); $bgap = S 6; $bbw = ($bw0 - 6 * $bgap) / 7
+            $by1 = $cy + $(if ($Big) { S 162 } else { S 100 }); $bmaxH = $(if ($Big) { S 92 } else { S 40 })
+            if ($Big) { $bgap = S 14; $bbw = ($bw0 - 6 * $bgap) / 7 }
+            for ($d = 0; $d -lt 7; $d++) {
+                $v = [math]::Min(100, [double]$vals[$d])
+                $bh = [math]::Max((S 3), $bmaxH * $v / 100)
+                $bc = $(if ($d -eq 6) { $StatsInk.Text } else { $StatsInk.BarIdle })
+                $bxd = $bx0 + $d * ($bbw + $bgap)
+                $bp = New-RoundPath $bxd ($by1 - $bh) $bbw $bh ([math]::Min((S 3), $bbw / 2))
+                $bb = New-Object System.Drawing.SolidBrush($bc); $g.FillPath($bb, $bp); $bb.Dispose(); $bp.Dispose()
+                $dn = [DateTime]::Today.AddDays($d - 6).ToString('ddd', [Globalization.CultureInfo]::InvariantCulture)
+                $script:statsHits += @{ Rect = (New-Object System.Drawing.RectangleF($bxd, ($by1 - $bmaxH), $bbw, $bmaxH)); Text = ('{0}: peak {1}%' -f $dn, [int][math]::Round($v)) }
+                if ($Big) {
+                    # value above each bar and the day under it
+                    [void](SDraw $g ('{0}%' -f [int][math]::Round($v)) $StatsFont.Small $(if ($d -eq 6) { $StatsInk.Text } else { $StatsInk.Second }) ($bxd + $bbw / 2) ($by1 - $bh - (S 17)) 'center')
+                    [void](SDraw $g $(if ($d -eq 6) { 'Today' } else { $dn }) $StatsFont.Small $StatsInk.Axis ($bxd + $bbw / 2) ($by1 + (S 6)) 'center')
+                }
+            }
+            if (-not $Big) {
+                $first = [DateTime]::Today.AddDays(-6).ToString('ddd', [Globalization.CultureInfo]::InvariantCulture)
+                [void](SDraw $g $first $StatsFont.Small $StatsInk.Axis $bx0 ($by1 + (S 6)))
+                [void](SDraw $g 'Today' $StatsFont.Small $StatsInk.Axis ($bx0 + $bw0) ($by1 + (S 6)) 'right')
+            }
+        }
+    }
+    $boxH
+}
+
+# One page per sidebar item: Overview (everything), API value (big chart), Limits history, Models, Projects.
+function Render-Stats($prov, [int]$W) {
+    $script:statsHits = @(); $script:statsClicks = @(); $script:statsSections = @{}
+    $period = 'month'; $nav = 'overview'
+    if ($script:statsUi) {
+        if ($script:statsUi.Period) { $period = $script:statsUi.Period }
+        if ($script:statsUi.Nav) { $nav = $script:statsUi.Nav }
+    }
+    $H = S 2400
     $bmp = New-Object System.Drawing.Bitmap($W, $H)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.Clear($StatsInk.Surface)
     $g.SmoothingMode = 'AntiAlias'
     $g.PixelOffsetMode = 'HighQuality'
-    $pad = S 24; $cw = $W - 2 * $pad
-    $sum = $null
-    try { $sum = [AILimitsUI.UsageLog]::Summarize($prov.id, (Join-Path $AppDir 'usage'), $PricingPath, [DateTime]::Now) } catch { Write-Log "stats: $_" }
-    $y = S 18
-    $hsz = SDraw $g ([string]$prov.name) $StatsFont.H1 $StatsInk.Text $pad $y
-    [void](SDraw $g 'API value from Claude Code / Codex logs' $StatsFont.Small $StatsInk.Faint ($pad + $hsz.Width + (S 14)) ($y + (S 9)))
-    $y += S 44
+    $pad = S 24; $cw = $W - 2 * $pad; $gap = S 12
+    $sum = Get-StatsSummary $prov
+    $now = [DateTime]::Now
+    $prevName = $now.AddMonths(-1).ToString('MMM', [Globalization.CultureInfo]::InvariantCulture)
+    $y = S 2
 
-    # headline numbers
-    $plan = Get-StatsPlan $prov
-    $month = 0.0; $today = 0.0; $req = 0.0; $tok = 0.0
-    if ($sum) { $month = $sum.MonthCost; $today = $sum.TodayCost; $req = $sum.MonthRequests; $tok = $sum.MonthTokens }
-    $tiles = @(
-        @('API value this month', (Format-Money $month)),
-        @('Today', (Format-Money $today)),
-        @('Compared with the plan', $(if ($plan -gt 0) { '×{0:N1}' -f ($month / $plan) } else { '—' }))
-    )
-    $tw = $cw / 3
-    $rule = New-Object System.Drawing.Pen($StatsInk.Rule, 1)
-    $g.DrawLine($rule, $pad, [single]([math]::Round($y) + 0.5), $pad + $cw, [single]([math]::Round($y) + 0.5))
-    $g.DrawLine($rule, $pad, [single]([math]::Round($y + (S 80)) + 0.5), $pad + $cw, [single]([math]::Round($y + (S 80)) + 0.5))
-    for ($i = 0; $i -lt 3; $i++) {
-        $tx = $pad + $i * $tw
-        if ($i -gt 0) { $g.DrawLine($rule, [single]([math]::Round($tx) + 0.5), $y, [single]([math]::Round($tx) + 0.5), $y + (S 80)); $tx += S 20 }
-        [void](SDraw $g $tiles[$i][0].ToUpperInvariant() $StatsFont.Caps $StatsInk.Faint $tx ($y + (S 14)))
-        [void](SDraw $g $tiles[$i][1] $StatsFont.Kpi $StatsInk.Text $tx ($y + (S 32)))
-    }
-    $rule.Dispose()
-    $y += S 92
-    $sub = '{0:N0} requests · {1:N1}M tokens this month' -f $req, ($tok / 1e6)
-    if ($plan -gt 0) { $sub += (' · plan ${0:N0}/month' -f $plan) }
-    $sub += ' · prices from pricing.tsv'
-    [void](SDraw $g $sub $StatsFont.Small $StatsInk.Muted $pad $y)
-    $y += S 30
-
-    # today by hour
-    [void](SDraw $g 'Today by hour (API value)' $StatsFont.H2 $StatsInk.Text $pad $y)
-    $y += S 26
-    $hv = New-Object double[] 24; $hl = New-Object string[] 24; $ht = New-Object string[] 24
-    for ($i = 0; $i -lt 24; $i++) {
-        if ($sum) { $hv[$i] = $sum.Hours[$i] }
-        if ($i % 3 -eq 0) { $hl[$i] = '{0:00}' -f $i }
-        $ht[$i] = '{0:00}:00–{1:00}:00 · {2}' -f $i, (($i + 1) % 24), (Format-Money $hv[$i])
-    }
-    Draw-Columns $g $pad $y $cw (S 130) $hv $hl $ht
-    $y += S 150
-
-    # last 14 days
-    [void](SDraw $g 'Last 14 days (API value)' $StatsFont.H2 $StatsInk.Text $pad $y)
-    $y += S 26
-    $dv = New-Object double[] 14; $dl = New-Object string[] 14; $dt = New-Object string[] 14
-    for ($i = 0; $i -lt 14; $i++) {
-        $day = [DateTime]::Today.AddDays($i - 13)
-        if ($sum -and $i -lt $sum.Days.Count) { $dv[$i] = $sum.Days[$i].Value }
-        $dl[$i] = $day.ToString('dd.MM')
-        if ($i % 2 -eq 1 -and $i -ne 13) { $dl[$i] = '' }
-        $dt[$i] = $day.ToString('ddd dd.MM') + ' · ' + (Format-Money $dv[$i])
-    }
-    Draw-Columns $g $pad $y $cw (S 130) $dv $dl $dt
-    $y += S 150
-
-    # limit history
-    [void](SDraw $g 'Limits, last 7 days' $StatsFont.H2 $StatsInk.Text $pad $y)
-    $y += S 26
-    $t1 = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); $t0 = $t1 - 7 * 86400
-    $hf = Join-Path $AppDir ('history-' + $prov.id + '.tsv')
-    $byLabel = [ordered]@{}
-    if (Test-Path $hf) {
-        foreach ($ln in Get-Content $hf) {
-            $a = $ln.Split("`t")
-            if ($a.Count -lt 3) { continue }
-            $tt = [int64]$a[0]
-            if ($tt -lt $t0) { continue }
-            if (-not $byLabel.Contains($a[1])) { $byLabel[$a[1]] = New-Object System.Collections.ArrayList }
-            [void]$byLabel[$a[1]].Add(@($tt, [double]::Parse($a[2], [Globalization.CultureInfo]::InvariantCulture)))
+    $y += (Draw-StatsKpis $g $y) + (S 14)
+    switch ($nav) {
+        'value' {
+            Draw-StatsChart $g $pad $y $cw (S 440)
+            $y += S 440
+        }
+        'limits' {
+            $y += Draw-StatsLimits $g $y -Big
+        }
+        { $_ -in 'models', 'projects' } {
+            $script:statsMode = $nav
+            $cnt = 0
+            if ($sum) { $cnt = $(if ($nav -eq 'models') { @($sum.Models).Count } else { @($sum.Projects).Count }) }
+            $rows = [math]::Min(40, [math]::Max(1, $cnt))
+            $th = (S 72) + $rows * (S 38) + (S 10)
+            Draw-StatsTable $g $pad $y $cw $th 40
+            $y += $th
+        }
+        default {
+            $rowH = S 318
+            $lw = [math]::Round(($cw - $gap) * 0.56); $rw = $cw - $gap - $lw
+            Draw-StatsChart $g $pad $y $lw $rowH
+            Draw-StatsTable $g ($pad + $lw + $gap) $y $rw $rowH 6
+            $y += $rowH + (S 14)
+            $y += Draw-StatsLimits $g $y
         }
     }
-    $series = @(); $colors = @($StatsInk.Blue, $StatsInk.Orange); $ci = 0
-    foreach ($k in $byLabel.Keys) {
-        if ($ci -ge 2) { break }
-        $series += @{ Name = [string]$k; Color = $colors[$ci]; Pts = @($byLabel[$k]) }
-        $ci++
-    }
-    if ($series.Count) {
-        $lx = $pad
-        foreach ($s in $series) {
-            $db = New-Object System.Drawing.SolidBrush($s.Color)
-            $g.FillRectangle($db, $lx, $y + (S 7), (S 14), (S 2)); $db.Dispose()
-            $sz = SDraw $g $s.Name $StatsFont.Small $StatsInk.Muted ($lx + (S 20)) $y
-            $lx += $sz.Width + (S 28)
-        }
-        $y += S 22
-        Draw-LimitLines $g $pad $y $cw (S 150) $series $t0 $t1
-    } else {
-        [void](SDraw $g 'History starts filling in from now on — the widget records every reading.' $StatsFont.Body $StatsInk.Muted $pad $y)
-    }
-    $y += S 176
-
-    # top lists
-    $half = ($cw - (S 24)) / 2
-    [void](SDraw $g 'Top models this month' $StatsFont.H2 $StatsInk.Text $pad $y)
-    [void](SDraw $g 'Top projects this month' $StatsFont.H2 $StatsInk.Text ($pad + $half + (S 24)) $y)
-    $y += S 28
-    $models = @(); $projects = @()
-    if ($sum) { $models = @($sum.Models); $projects = @($sum.Projects) }
-    Draw-TopList $g $pad $y $half $models 5
-    Draw-TopList $g ($pad + $half + (S 24)) $y $half $projects 5
-    $y += S 172
+    $y += S 24
 
     $g.Dispose()
-    if ($y -lt $H) {
-        $crop = $bmp.Clone((New-Object System.Drawing.Rectangle(0, 0, $W, [int]$y)), $bmp.PixelFormat)
-        $bmp.Dispose()
-        return $crop
+    $crop = $bmp.Clone((New-Object System.Drawing.Rectangle(0, 0, $W, [int][math]::Min($H, $y))), $bmp.PixelFormat)
+    $bmp.Dispose()
+    $crop
+}
+
+function Export-StatsCsv($prov) {
+    $sum = Get-StatsSummary $prov
+    if (-not $sum) { [System.Windows.Forms.MessageBox]::Show('There is no usage data to export yet.', $AppName) | Out-Null; return }
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Filter = 'CSV (*.csv)|*.csv'
+    $dlg.FileName = ('ai-limits-{0}-{1}.csv' -f ($prov.name -replace '[^\w\-]+', '-'), [DateTime]::Now.ToString('yyyy-MM'))
+    if ($dlg.ShowDialog() -ne 'OK') { return }
+    $ic = [Globalization.CultureInfo]::InvariantCulture
+    $out = New-Object System.Collections.Generic.List[string]
+    $out.Add('section,key,api_value_usd')
+    $now = [DateTime]::Now
+    for ($d = 1; $d -le $now.Day; $d++) { $out.Add(('day,{0},{1}' -f (New-Object DateTime($now.Year, $now.Month, $d)).ToString('yyyy-MM-dd'), $sum.MonthDays[$d - 1].ToString('0.####', $ic))) }
+    foreach ($m in $sum.Models) { $out.Add(('model,"{0}",{1}' -f ($m.Key -replace '"', '""'), $m.Value.ToString('0.####', $ic))) }
+    foreach ($p in $sum.Projects) { $out.Add(('project,"{0}",{1}' -f ($p.Key -replace '"', '""'), $p.Value.ToString('0.####', $ic))) }
+    try {
+        [System.IO.File]::WriteAllLines($dlg.FileName, $out, (New-Object System.Text.UTF8Encoding($false)))
+        Start-Process explorer.exe -ArgumentList ('/select,"' + $dlg.FileName + '"')
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Could not save the file:`n$($_.Exception.Message)", $AppName) | Out-Null
     }
-    $bmp
+    $dlg.Dispose()
+}
+
+# --- sidebar (painted) ---
+$StatsNav = @(
+    @{ Id = 'overview'; Text = 'Overview' }, @{ Id = 'value'; Text = 'API value' }, @{ Id = 'limits'; Text = 'Limits history' },
+    @{ Id = 'models'; Text = 'Models' }, @{ Id = 'projects'; Text = 'Projects' }
+)
+
+function Draw-NavIcon($g, [string]$id, [single]$cx, [single]$cy, $color) {
+    $k = [single](S 1); $pen = New-Object System.Drawing.Pen($color, [single](S 1.3))
+    $pen.LineJoin = 'Round'
+    $P = { param($x, $y) [System.Drawing.PointF]::new(($cx + ($x - 8) * $k), ($cy + ($y - 8) * $k)) }
+    switch ($id) {
+        'overview' { foreach ($r in @(@(2, 2), @(9, 2), @(2, 9), @(9, 9))) { $g.DrawRectangle($pen, ($cx + ($r[0] - 8) * $k), ($cy + ($r[1] - 8) * $k), (5 * $k), (5 * $k)) } }
+        'value' { $g.DrawLines($pen, [System.Drawing.PointF[]]@((& $P 2 13), (& $P 6 8), (& $P 9 11), (& $P 14 4))) }
+        'limits' { $g.DrawEllipse($pen, ($cx - 6 * $k), ($cy - 6 * $k), (12 * $k), (12 * $k)); $g.DrawLines($pen, [System.Drawing.PointF[]]@((& $P 8 4.5), (& $P 8 8), (& $P 10.5 9.5))) }
+        'models' { $g.DrawPolygon($pen, [System.Drawing.PointF[]]@((& $P 8 2), (& $P 13.5 5), (& $P 13.5 11), (& $P 8 14), (& $P 2.5 11), (& $P 2.5 5))); $g.DrawLines($pen, [System.Drawing.PointF[]]@((& $P 2.5 5), (& $P 8 8), (& $P 13.5 5))); $g.DrawLine($pen, (& $P 8 8), (& $P 8 14)) }
+        'projects' { $g.DrawLines($pen, [System.Drawing.PointF[]]@((& $P 2 4.5), (& $P 6 4.5), (& $P 7.5 6), (& $P 14 6), (& $P 14 12.5), (& $P 2 12.5), (& $P 2 4.5))) }
+    }
+    $pen.Dispose()
+}
+
+function Paint-StatsSide($g, [int]$w, [int]$h) {
+    $u = $script:statsUi
+    $u.SideHits = @()
+    $g.SmoothingMode = 'AntiAlias'
+    $g.Clear($StatsInk.Side)
+    $x = S 12; $iw = $w - (S 24)
+    # app tile
+    SCard $g $x (S 12) $iw (S 40) $StatsInk.Surface $StatsInk.Border (S 10)
+    $lx = $x + (S 10); $ly = S 20
+    $lb = New-RoundPath $lx $ly (S 24) (S 24) (S 6)
+    $bb = New-Object System.Drawing.SolidBrush($StatsInk.Text); $g.FillPath($bb, $lb); $bb.Dispose(); $lb.Dispose()
+    $wb = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White); $ob = New-Object System.Drawing.SolidBrush($StatsInk.Accent)
+    $g.FillRectangle($wb, $lx + (S 6), $ly + (S 13), (S 3), (S 6)); $g.FillRectangle($wb, $lx + (S 10.5), $ly + (S 10), (S 3), (S 9)); $g.FillRectangle($ob, $lx + (S 15), $ly + (S 7), (S 3), (S 12))
+    $wb.Dispose(); $ob.Dispose()
+    [void](SBase $g 'AI Limits' $StatsFont.NavSemi $StatsInk.Text ($lx + (S 34)) ((S 32) + (Get-Cap $StatsFont.NavSemi) / 2))
+    $y = S 66
+    foreach ($n in $StatsNav) {
+        $sel = ($u.Nav -eq $n.Id)
+        if ($sel) { SCard $g $x $y $iw (S 34) $StatsInk.Sel $null (S 8) }
+        Draw-NavIcon $g $n.Id ($x + (S 18)) ($y + (S 17)) $(if ($sel) { $StatsInk.Text } else { $StatsInk.Second })
+        [void](SBase $g $n.Text $StatsFont.Nav $(if ($sel) { $StatsInk.Text } else { $StatsInk.Second }) ($x + (S 36)) ($y + (S 17) + (Get-Cap $StatsFont.Nav) / 2))
+        $u.SideHits += @{ Rect = (New-Object System.Drawing.Rectangle([int]$x, [int]$y, [int]$iw, [int](S 34))); Nav = $n.Id }
+        $y += S 36
+    }
+    $y += S 8
+    $rp = New-Object System.Drawing.Pen($StatsInk.Border, 1); $g.DrawLine($rp, $x + (S 4), [single]([math]::Round($y) + 0.5), $x + $iw - (S 4), [single]([math]::Round($y) + 0.5)); $rp.Dispose()
+    $y += S 14
+    [void](SDraw $g 'Accounts' $StatsFont.Small $StatsInk.Muted ($x + (S 10)) $y)
+    $y += S 20
+    for ($i = 0; $i -lt $u.Accts.Count; $i++) {
+        $a = $u.Accts[$i]
+        $sel = ($i -eq $u.Index)
+        if ($sel) { SCard $g $x $y $iw (S 34) $StatsInk.Surface $StatsInk.Border (S 8) }
+        $dot = $StatsInk.Off
+        foreach ($r in @($script:results)) { if ($r -and $r.Id -eq $a.id) { $dot = $(if ($r.Error) { $Glass.Bad } elseif ($r.Status) { $Glass.Warn } else { $StatsInk.Ok }) } }
+        $db = New-Object System.Drawing.SolidBrush($dot); $g.FillEllipse($db, $x + (S 11), $y + (S 13.5), (S 7), (S 7)); $db.Dispose()
+        $nm = Fit-Str ([string]$a.name) $StatsFont.Nav ($iw - (S 40))
+        [void](SBase $g $nm $StatsFont.Nav $(if ($sel) { $StatsInk.Text } else { $StatsInk.Second }) ($x + (S 26)) ($y + (S 17) + (Get-Cap $StatsFont.Nav) / 2))
+        $u.SideHits += @{ Rect = (New-Object System.Drawing.Rectangle([int]$x, [int]$y, [int]$iw, [int](S 34))); Acct = $i }
+        $y += S 36
+    }
+    # bottom card (the "Edit prices" button is a real control placed over it)
+    $ch = S 150; $cy = $h - (S 12) - $ch
+    SCard $g $x $cy $iw $ch $StatsInk.Surface $StatsInk.Border
+    SCard $g ($x + (S 14)) ($cy + (S 14)) (S 32) (S 32) $null $StatsInk.Border (S 8)
+    $dp = New-Object System.Drawing.Pen($StatsInk.Text, [single](S 1.3))
+    $ix = $x + (S 22); $iy = $cy + (S 22)
+    $g.DrawLines($dp, [System.Drawing.PointF[]]@([System.Drawing.PointF]::new($ix, $iy), [System.Drawing.PointF]::new(($ix + (S 11)), $iy), [System.Drawing.PointF]::new(($ix + (S 16)), ($iy + (S 5))), [System.Drawing.PointF]::new(($ix + (S 16)), ($iy + (S 16))), [System.Drawing.PointF]::new($ix, ($iy + (S 16))), [System.Drawing.PointF]::new($ix, $iy)))
+    $g.DrawLine($dp, $ix + (S 4), $iy + (S 9), $ix + (S 12), $iy + (S 9)); $g.DrawLine($dp, $ix + (S 4), $iy + (S 12.5), $ix + (S 9), $iy + (S 12.5))
+    $dp.Dispose()
+    [void](SDraw $g 'Prices per model' $StatsFont.NavSemi $StatsInk.Text ($x + (S 14)) ($cy + (S 56)))
+    [void](SDraw $g '"API value" uses pricing.tsv' $StatsFont.Label $StatsInk.Muted ($x + (S 14)) ($cy + (S 77)))
+    $u.PriceBtnTop = $cy + $ch - (S 14) - (S 34)
+}
+
+function Update-StatsView {
+    $u = $script:statsUi
+    if (-not $u -or $u.Form.IsDisposed) { return }
+    $prov = $u.Accts[$u.Index]
+    $ci = [Globalization.CultureInfo]::InvariantCulture
+    $mon = [DateTime]::Now.ToString('MMMM', $ci)
+    switch ($u.Nav) {
+        'value' { $u.TitleText = $(if ($u.Period -eq 'prev') { '{0}, API value in {1}' -f $prov.name, [DateTime]::Now.AddMonths(-1).ToString('MMMM', $ci) } else { '{0}, API value per day' -f $prov.name }) }
+        'limits' { $u.TitleText = '{0}, limits over the last 7 days' -f $prov.name }
+        'models' { $u.TitleText = '{0}, models in {1}' -f $prov.name, $mon }
+        'projects' { $u.TitleText = '{0}, projects in {1}' -f $prov.name, $mon }
+        default { $u.TitleText = '{0}, {1} so far' -f $prov.name, $mon }
+    }
+    $u.UpdatedText = 'Last updated ' + [DateTime]::Now.ToString('HH:mm')
+    $u.Head.Invalidate()
+    $w = [math]::Max((S 600), ($u.Head.Width - [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth))
+    $old = $u.Pic.Image
+    $u.Pic.Image = Render-Stats $prov $w
+    if ($old) { $old.Dispose() }
+    $u.LastWidth = $u.Head.Width
+    $u.Side.Invalidate()
+}
+
+function Set-StatsRefreshing([bool]$on) {
+    $u = $script:statsUi
+    if (-not $u -or $u.Form.IsDisposed) { return }
+    $u.BtnRefresh.Enabled = -not $on
+    $u.BtnRefresh.Text = $(if ($on) { 'Refreshing…' } else { 'Refresh' })
+    if ($on) { $u.RefreshGuard.Stop(); $u.RefreshGuard.Start() } else { $u.RefreshGuard.Stop() }
+}
+
+# right edge shared by the header and the page: the page always keeps room for its scrollbar
+function Get-StatsRight {
+    $u = $script:statsUi
+    $u.Head.Width - [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth - (S 24)
+}
+
+function Set-StatsHeadLayout {
+    $u = $script:statsUi
+    if (-not $u) { return }
+    $r = Get-StatsRight
+    $u.BtnRefresh.Location = New-Object System.Drawing.Point([int]($r - $u.BtnRefresh.Width), (S 58))
+    $u.BtnCsv.Location = New-Object System.Drawing.Point([int]($u.BtnRefresh.Left - (S 8) - $u.BtnCsv.Width), (S 58))
+    $u.Head.Invalidate()
+}
+
+$StatsTitles = @{ overview = 'Overview'; value = 'API value'; limits = 'Limits history'; models = 'Models'; projects = 'Projects' }
+
+function Paint-StatsHead($g) {
+    $u = $script:statsUi
+    if (-not $u) { return }
+    $g.Clear($StatsInk.Surface)
+    $g.SmoothingMode = 'AntiAlias'
+    $x = S 24; $r = Get-StatsRight
+    $cb = (S 16) + (S 14) + (Get-Cap $StatsFont.NavSemi) / 2      # breadcrumb row centred at 30
+    Draw-NavIcon $g $u.Nav ($x + (S 6)) (S 30) $StatsInk.Text
+    [void](SBase $g $StatsTitles[$u.Nav] $StatsFont.NavSemi $StatsInk.Text ($x + (S 24)) $cb)
+    [void](SBase $g $u.UpdatedText $StatsFont.Label $StatsInk.Muted $r $cb 'right')
+    $tb = (S 75) + (Get-Cap $StatsFont.H1) / 2                     # title row centred at 75, like the buttons
+    $maxW = $u.BtnCsv.Left - (S 16) - $x
+    [void](SBase $g (Fit-Str $u.TitleText $StatsFont.H1 $maxW) $StatsFont.H1 $StatsInk.Text ($x - (S 1)) $tb)
 }
 
 function Show-Stats {
     $accts = @($script:cfg.providers | Where-Object { $_.type -in 'claude-code', 'codex' })
     if (-not $accts) { [System.Windows.Forms.MessageBox]::Show('Statistics need a Claude or ChatGPT (Codex) account in Settings.', $AppName) | Out-Null; return }
     if ($script:statsForm -and -not $script:statsForm.IsDisposed) { $script:statsForm.Activate(); return }
+    if (-not $script:statsMode) { $script:statsMode = 'projects' }
 
     $sf = New-Object System.Windows.Forms.Form
     $sf.Text = 'AI Limits — Statistics'
     $sf.StartPosition = 'CenterScreen'
     $sf.ShowIcon = $false
-    $sf.ClientSize = New-Object System.Drawing.Size((S 760), (S 720))
-    $sf.MinimumSize = New-Object System.Drawing.Size((S 500), (S 400))
+    $sf.BackColor = $StatsInk.Surface
+    $sf.Font = $DlgFonts.Body
+    $sf.ClientSize = New-Object System.Drawing.Size((S 1120), (S 760))
+    $sf.MinimumSize = New-Object System.Drawing.Size((S 900), (S 560))
 
-    $top = New-Object System.Windows.Forms.Panel
-    $top.Dock = 'Top'; $top.Height = S 52
-    $sf.Controls.Add($top)
+    # sidebar
+    $side = New-Object AILimitsUI.BufferedPanel
+    $side.Dock = 'Left'; $side.Width = S 212
+    $sf.Controls.Add($side)
+    $sep = New-Object System.Windows.Forms.Panel
+    $sep.Dock = 'Left'; $sep.Width = 1; $sep.BackColor = (New-Rgb '#E6E6E6')
+    $sf.Controls.Add($sep)
+    $sep.BringToFront()
 
-    $cb = New-Object System.Windows.Forms.ComboBox
-    $cb.DropDownStyle = 'DropDownList'
-    $cb.Location = New-Object System.Drawing.Point((S 24), (S 15))
-    $cb.Size = New-Object System.Drawing.Size((S 260), (S 26))
-    foreach ($a in $accts) { [void]$cb.Items.Add([string]$a.name) }
-    $top.Controls.Add($cb)
+    $priceBtn = New-Object AILimitsUI.RoundButton
+    $priceBtn.Text = 'Edit prices'
+    $priceBtn.Size = New-Object System.Drawing.Size(($side.Width - (S 52)), (S 34))
+    $priceBtn.Add_Click({ Start-Process notepad.exe -ArgumentList ('"' + $PricingPath + '"') })
+    $side.Controls.Add($priceBtn)
 
-    $rb = New-Object AILimitsUI.RoundButton
-    $rb.Text = 'Refresh'
-    $rb.Location = New-Object System.Drawing.Point((S 296), (S 12))
-    $rb.Size = New-Object System.Drawing.Size((S 96), (S 30))
-    $top.Controls.Add($rb)
+    # right column = header (does not scroll) + scrolling page; the sidebar runs the full height on the left
+    $col = New-Object System.Windows.Forms.Panel
+    $col.Dock = 'Fill'; $col.BackColor = $StatsInk.Surface
+    $sf.Controls.Add($col)
+    $col.BringToFront()
 
-    $pricing = New-Object AILimitsUI.RoundButton
-    $pricing.Text = 'Edit prices…'
-    $pricing.Location = New-Object System.Drawing.Point((S 400), (S 12))
-    $pricing.Size = New-Object System.Drawing.Size((S 116), (S 30))
-    $pricing.Add_Click({ Start-Process notepad.exe -ArgumentList ('"' + $PricingPath + '"') })
-    $top.Controls.Add($pricing)
+    # header is painted (breadcrumb icon + section name, "Last updated", title) so everything sits on exact baselines
+    $head = New-Object AILimitsUI.BufferedPanel
+    $head.Dock = 'Top'; $head.Height = S 106; $head.BackColor = $StatsInk.Surface
+    $col.Controls.Add($head)
+    $btnRefresh = New-Object AILimitsUI.RoundButton
+    $btnRefresh.Text = 'Refresh'; $btnRefresh.Size = New-Object System.Drawing.Size((S 96), (S 34))
+    $head.Controls.Add($btnRefresh)
+    $btnCsv = New-Object AILimitsUI.RoundButton
+    $btnCsv.Text = 'Export CSV'; $btnCsv.Size = New-Object System.Drawing.Size((S 112), (S 34))
+    $head.Controls.Add($btnCsv)
 
-    $panel = New-Object System.Windows.Forms.Panel
-    $panel.Dock = 'Fill'; $panel.AutoScroll = $true
-    $sf.Controls.Add($panel)
-    $panel.BringToFront()
-
+    $scroll = New-Object System.Windows.Forms.Panel
+    $scroll.Dock = 'Fill'; $scroll.AutoScroll = $true; $scroll.BackColor = $StatsInk.Surface
+    $col.Controls.Add($scroll)
+    $scroll.BringToFront()
     $pb = New-Object System.Windows.Forms.PictureBox
     $pb.SizeMode = 'AutoSize'
     $pb.Location = New-Object System.Drawing.Point(0, 0)
-    $panel.Controls.Add($pb)
+    $scroll.Controls.Add($pb)
 
     $tip = New-Object System.Windows.Forms.ToolTip
-    $script:statsUi = @{ Form = $sf; Combo = $cb; Pic = $pb; Tip = $tip; Accts = $accts; LastTip = '' }
-    $redraw = {
+    $resizeTimer = New-Object System.Windows.Forms.Timer
+    $resizeTimer.Interval = 200
+    $resizeTimer.Add_Tick({
+        $this.Stop()
         $u = $script:statsUi
-        $i = [math]::Max(0, $u.Combo.SelectedIndex)
-        $old = $u.Pic.Image
-        $u.Pic.Image = Render-Stats $u.Accts[$i]
-        if ($old) { $old.Dispose() }
-    }
-    $script:statsRedraw = $redraw
-    $cb.Add_SelectedIndexChanged({ & $script:statsRedraw })
-    $rb.Add_Click({ Start-Refresh -Force; & $script:statsRedraw })
+        if ($u.Head.Width -ne $u.LastWidth) { Update-StatsView }
+    })
+    # if a refresh never reports back (network stuck), the button comes back after two minutes
+    $guard = New-Object System.Windows.Forms.Timer
+    $guard.Interval = 120000
+    $guard.Add_Tick({ Set-StatsRefreshing $false })
+    $pricesAt = [DateTime]::MinValue
+    if (Test-Path $PricingPath) { $pricesAt = (Get-Item $PricingPath).LastWriteTime }
+    $script:statsUi = @{ Form = $sf; Side = $side; Pic = $pb; Scroll = $scroll; Tip = $tip; Accts = $accts; Index = 0; Nav = 'overview'; LastTip = ''; Head = $head; TitleText = ''; UpdatedText = ''; PriceBtn = $priceBtn; SideHits = @(); BtnRefresh = $btnRefresh; BtnCsv = $btnCsv; Period = 'month'; SumCache = @{}; ResizeTimer = $resizeTimer; RefreshGuard = $guard; LastWidth = 0; PricesAt = $pricesAt }
+
+
+    $side.Add_Paint({ param($s, $e) Paint-StatsSide $e.Graphics $s.Width $s.Height; $script:statsUi.PriceBtn.Location = New-Object System.Drawing.Point((S 26), [int]$script:statsUi.PriceBtnTop) })
+    $side.Add_MouseClick({
+        param($s, $e)
+        $u = $script:statsUi
+        foreach ($h in @($u.SideHits)) {
+            if (-not $h.Rect.Contains($e.Location)) { continue }
+            if ($null -ne $h.Acct) { $u.Index = [int]$h.Acct; $u.Nav = 'overview'; $u.Scroll.AutoScrollPosition = New-Object System.Drawing.Point(0, 0); Update-StatsView; return }
+            # each item opens its own page
+            $u.Nav = $h.Nav
+            if ($h.Nav -in 'models', 'projects') { $script:statsMode = $h.Nav }
+            $u.Scroll.AutoScrollPosition = New-Object System.Drawing.Point(0, 0)
+            Update-StatsView
+            return
+        }
+    })
+    $side.Add_MouseMove({
+        param($s, $e)
+        $hand = $false
+        foreach ($h in @($script:statsUi.SideHits)) { if ($h.Rect.Contains($e.Location)) { $hand = $true } }
+        $s.Cursor = $(if ($hand) { [System.Windows.Forms.Cursors]::Hand } else { [System.Windows.Forms.Cursors]::Default })
+    })
     $pb.Add_MouseMove({
         $txt = ''
         foreach ($h in @($script:statsHits)) { if ($h.Rect.Contains([single]$_.X, [single]$_.Y)) { $txt = [string]$h.Text; break } }
+        $hand = $false
+        foreach ($c in @($script:statsClicks)) { if ($c.Rect.Contains([single]$_.X, [single]$_.Y)) { $hand = $true; $txt = [string]$c.Tip } }
+        $script:statsUi.Pic.Cursor = $(if ($hand) { [System.Windows.Forms.Cursors]::Hand } else { [System.Windows.Forms.Cursors]::Default })
         if ($txt -ne $script:statsUi.LastTip) { $script:statsUi.LastTip = $txt; $script:statsUi.Tip.SetToolTip($script:statsUi.Pic, $txt) }
     })
-    Set-DialogStyle $sf @() @()
-    $top.BackColor = $DlgColors.Bg
-    $panel.BackColor = $StatsInk.Surface
-    [void](New-Hairline $top 0 ($top.Height - 1) (S 4000))
-    $cb.SelectedIndex = 0
-    $sf.Add_FormClosed({ if ($script:statsUi.Pic.Image) { $script:statsUi.Pic.Image.Dispose() }; $script:statsForm = $null })
+    $pb.Add_MouseClick({
+        foreach ($c in @($script:statsClicks)) {
+            if ($c.Rect.Contains([single]$_.X, [single]$_.Y)) {
+                if ($c.Action -eq 'period') {
+                    $script:statsUi.Period = $(if ($script:statsUi.Period -eq 'prev') { 'month' } else { 'prev' })
+                } else {
+                    $script:statsMode = $c.Action
+                    if ($script:statsUi.Nav -in 'models', 'projects') { $script:statsUi.Nav = $c.Action }
+                }
+                $pos = $script:statsUi.Scroll.AutoScrollPosition
+                Update-StatsView
+                $script:statsUi.Scroll.AutoScrollPosition = New-Object System.Drawing.Point(0, (-$pos.Y))
+                return
+            }
+        }
+    })
+    # Refresh starts the background fetch (which also rescans the logs); the page redraws when it reports back
+    $btnRefresh.Add_Click({ $script:statsUi.SumCache = @{}; Set-StatsRefreshing $true; Start-Refresh -Force })
+    $btnCsv.Add_Click({ Export-StatsCsv $script:statsUi.Accts[$script:statsUi.Index] })
+    $sf.Add_Resize({ if (-not $script:statsUi) { return }; Set-StatsHeadLayout; $script:statsUi.ResizeTimer.Stop(); $script:statsUi.ResizeTimer.Start() })
+    $sf.Add_Shown({ Set-StatsHeadLayout; Update-StatsView })
+    # prices edited in Notepad take effect as soon as you come back to the window
+    $sf.Add_Activated({
+        $u = $script:statsUi
+        if (-not $u -or -not (Test-Path $PricingPath)) { return }
+        $t = (Get-Item $PricingPath).LastWriteTime
+        if ($t -ne $u.PricesAt) { $u.PricesAt = $t; $u.SumCache = @{}; Update-StatsView }
+    })
+    # the wheel scrolls the page wherever the pointer is
+    $pb.Add_MouseEnter({ if ($script:statsUi.Form.ContainsFocus) { $script:statsUi.Scroll.Focus() } })
+    $side.Add_MouseWheel({ $s = $script:statsUi.Scroll; $p = -$s.AutoScrollPosition.Y - [math]::Sign($_.Delta) * (S 80); $s.AutoScrollPosition = New-Object System.Drawing.Point(0, [int][math]::Max(0, $p)) })
+
+    Set-DialogStyle $sf @($btnRefresh, $priceBtn) @()
+    foreach ($b in @($btnRefresh, $priceBtn, $btnCsv)) { $b.Radius = [single](S 8) }
+    $btnCsv.BackColor = $StatsInk.Surface
+    $priceBtn.BackColor = $StatsInk.Text
+    $priceBtn.CornerColor = $StatsInk.Surface
+    $side.BackColor = $StatsInk.Side
+    $head.BackColor = $StatsInk.Surface
+    $scroll.BackColor = $StatsInk.Surface
+    $col.BackColor = $StatsInk.Surface
+    $head.Add_Paint({ param($s, $e) Paint-StatsHead $e.Graphics })
+    $sf.Add_FormClosed({
+        $u = $script:statsUi
+        $u.ResizeTimer.Stop(); $u.ResizeTimer.Dispose(); $u.RefreshGuard.Stop(); $u.RefreshGuard.Dispose()
+        if ($u.Pic.Image) { $u.Pic.Image.Dispose() }
+        $u.Tip.Dispose()
+        $script:statsForm = $null
+        $script:statsUi = $null
+    })
     $script:statsForm = $sf
     $sf.Show()
 }
@@ -4145,7 +4643,7 @@ $refreshTimer.Add_Tick({ Start-Refresh })
 
 $glassTimer = New-Object System.Windows.Forms.Timer
 $glassTimer.Interval = 3000
-$glassTimer.Add_Tick({ if ($form.Visible -and -not $script:pressed -and -not $script:suppressed) { Update-Visual } })
+$glassTimer.Add_Tick({ if ($form.Visible -and -not $script:pressed -and -not $script:suppressed) { Update-Visual -Recapture } })
 
 $fsTimer = New-Object System.Windows.Forms.Timer
 $fsTimer.Interval = 1000
